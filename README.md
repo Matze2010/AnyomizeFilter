@@ -46,9 +46,9 @@ sequenceDiagram
 ### Ablauf im Detail
 
 1. **`inlet()`** wird von Open WebUI vor dem LLM-Aufruf gerufen und delegiert an `process_input()`.
-2. **Dateien** (Modi `file_anonymization`, `text_file_anonymization`): `get_file_paths()` baut aus `body["files"]` die Pfade `UPLOAD_DIR/{file_id}_{filename}`. `process_multiple_files_for_ocr()` lädt alle Dateien parallel an `POST /api/ocr` hoch, sammelt die Job-IDs und pollt sie parallel bis `status == "completed"`. Ergebnis: `anonymized_text_raw` je Datei.
+2. **Dateien** (Modi `file_anonymization`, `text_file_anonymization`): `get_file_paths()` baut aus `body["files"]` die Pfade `UPLOAD_DIR/{file_id}_{filename}`. `process_multiple_files_for_ocr()` lädt alle Dateien parallel an `POST /api/ocr` hoch — zusammen mit der in der Valve `language` gesetzten Sprache —, sammelt die Job-IDs und pollt sie parallel bis `status == "completed"`. Ergebnis: `anonymized_text_raw` je Datei.
 3. **Text**: der Text der letzten User-Message wird an den OCR-Text angehängt.
-4. **Anonymisierung** (Modi `text_anonymization`, `text_file_anonymization`): der kombinierte Inhalt geht an `POST /api/anonymize`, die zurückgegebene `job_id` wird über `GET /api/status/{job_id}` gepollt. Der von der API gelieferte `systemprompt` (Regeln zum korrekten Umgang mit Platzhaltern) wird an den Inhalt angehängt.
+4. **Anonymisierung** (Modi `text_anonymization`, `text_file_anonymization`): der kombinierte Inhalt geht mit der konfigurierten Sprache an `POST /api/anonymize`, die zurückgegebene `job_id` wird über `GET /api/status/{job_id}` gepollt. Der von der API gelieferte `systemprompt` (Regeln zum korrekten Umgang mit Platzhaltern) wird an den Inhalt angehängt.
 5. **Ersetzen**: die letzte User-Message im `body` wird durch den maskierten Inhalt überschrieben. Open WebUI schickt sie so ans Modell — das LLM sieht nur Platzhalter.
 6. **`outlet()`** wird nach der LLM-Antwort gerufen. Bei `output_filter = "deanonymized"` geht die Assistant-Nachricht an `POST /api/deanonymize`; das Ergebnis ersetzt die Antwort im Chat. Bei `"anonymized"` bleibt sie unverändert, die Platzhalter bleiben sichtbar.
 7. **Statusmeldungen** („Processing files…", „Anonymizing content…", „De-anonymizing content…") laufen über `__event_emitter__` und erscheinen im Chat-Verlauf.
@@ -71,6 +71,7 @@ sequenceDiagram
 | Valve | Default | Bedeutung |
 |---|---|---|
 | `anymize_api_key` | `""` | API-Key von anymize.ai, Format `anymize_xxxxxxxxxxxxx`. Wird als `Authorization: Bearer …` gesendet. |
+| `language` | `de` | Sprache der PII-Erkennung; gilt für `/api/anonymize` **und** `/api/ocr`. Mögliche Werte: `de`, `en`, `fr`, `es`, `it`. |
 | `input_filter` | `text_anonymization` | Was vor dem LLM verarbeitet wird — siehe Modi unten. |
 | `output_filter` | `deanonymized` | Was mit der LLM-Antwort passiert — siehe unten. |
 | `priority` | `10` | Ausführungsreihenfolge unter mehreren Filtern; kleinere Werte laufen zuerst. |
@@ -80,7 +81,7 @@ sequenceDiagram
 | Wert | Verhalten |
 |---|---|
 | `text_anonymization` | Nur die letzte User-Message wird über `/api/anonymize` maskiert. Dateien werden ignoriert. |
-| `file_anonymization` | Angehängte Dateien laufen durch `/api/ocr` (OCR + Anonymisierung in einem Schritt). Der Text der User-Message wird angehängt, aber **nicht** zusätzlich maskiert (siehe [Bekannte Einschränkungen](#bekannte-einschränkungen)). |
+| `file_anonymization` | Angehängte Dateien laufen durch `/api/ocr` (OCR + Anonymisierung in einem Schritt). Maskiert wird gezielt nur der Dateiinhalt; der getippte Text der User-Message wird unverändert angehängt. Wer beides maskieren will, nimmt `text_file_anonymization`. |
 | `text_file_anonymization` | Dateien per OCR **und** der kombinierte Gesamttext anschließend per `/api/anonymize`. |
 
 ### `output_filter`-Modi
@@ -138,9 +139,6 @@ Alles in `class Filter` in [`anymize.py`](anymize.py):
 
 Stand der aktuellen Fassung von `anymize.py` (Version 1.0.0):
 
-- **NameError im Fehlerpfad der Datei-Verarbeitung**: `process_multiple_files_for_ocr()` ruft im `except`-Block `__event_emitter__` auf ([anymize.py:209](anymize.py:209)), das in dieser Methode nicht im Scope ist. Tritt beim Datei-Handling ein Fehler auf, verdeckt der resultierende `NameError` die eigentliche Ursache.
-- **`file_anonymization` maskiert den Nutzertext nicht**: In diesem Modus wird die letzte User-Message an den OCR-Text angehängt ([anymize.py:256-267](anymize.py:256)), der Aufruf von `/api/anonymize` findet aber nur in den Modi `text_anonymization` und `text_file_anonymization` statt ([anymize.py:273](anymize.py:273)). Der getippte Text geht damit unmaskiert ans LLM. Wer beides maskieren will, braucht `text_file_anonymization`.
-- **Sprache fest auf Englisch**: `_anonymize_text()` sendet `language="en"` ([anymize.py:104](anymize.py:104)); es gibt keine Valve dafür. Die API kennt `de, en, fr, es, it` mit Default `de`. Für deutsche Texte ist die Erkennungsqualität dadurch potenziell schlechter.
 - **Langes blockierendes Polling**: `_poll_status()` versucht es bis zu 150-mal im Abstand von 10 s ([anymize.py:88](anymize.py:88)) — im Extremfall hängt eine Anfrage 25 Minuten, bevor der Timeout greift.
 - **Kein Streaming-Support**: `outlet()` arbeitet auf der fertigen Nachricht. Bei aktivem Streaming sieht der Nutzer während der Ausgabe die rohen Platzhalter; erst am Ende wird ersetzt.
 - **Nur die letzte User-Message wird anonymisiert**: Ältere Nachrichten des Verlaufs gehen unverändert ans LLM. In laufenden Unterhaltungen können frühere Klartext-PII also weiterhin mitgeschickt werden.

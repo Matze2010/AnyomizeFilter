@@ -27,6 +27,20 @@ class Filter:
             description="Your anymize API key (format: anymize_xxxxxxxxxxxxx)",
         )
 
+        language: str = Field(
+            default="de",
+            description="Language used for anonymization and OCR",
+            json_schema_extra={
+                "enum": [
+                    "de",
+                    "en",
+                    "fr",
+                    "es",
+                    "it",
+                ]
+            },
+        )
+
         input_filter: str = Field(
             "text_anonymization",
             description="Controls how sensitive data in the input is processed before analysis",
@@ -101,7 +115,7 @@ class Filter:
 
         raise Exception(error_message)
 
-    async def _anonymize_text(self, text: str, language: str = "en") -> Dict[str, Any]:
+    async def _anonymize_text(self, text: str, language: str = "de") -> Dict[str, Any]:
 
         body = {
             "text": text,
@@ -132,6 +146,7 @@ class Filter:
 
             with open(file_path, "rb") as file:
                 data.add_field("file", file, filename=file_name)
+                data.add_field("language", self.valves.language)
 
                 async with session.post(
                     "https://app.anymize.ai/api/ocr", headers=headers, data=data
@@ -159,7 +174,7 @@ class Filter:
             return []
 
     async def process_multiple_files_for_ocr(
-        self, file_paths: List[str]
+        self, file_paths: List[str], event_emitter=None
     ) -> List[Dict[str, Any]]:
 
         if not file_paths:
@@ -206,16 +221,17 @@ class Filter:
 
         except Exception as e:
             print(f"Error processing multiple files: {e}")
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": f"❌ Anonymization failed: {str(e)}",
-                        "done": True,
-                        "hidden": False,
-                    },
-                }
-            )
+            if event_emitter:
+                await event_emitter(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": f"❌ Anonymization failed: {str(e)}",
+                            "done": True,
+                            "hidden": False,
+                        },
+                    }
+                )
             return []
 
     async def process_input(
@@ -243,7 +259,9 @@ class Filter:
                     }
                 )
 
-                ocr_results = await self.process_multiple_files_for_ocr(file_paths)
+                ocr_results = await self.process_multiple_files_for_ocr(
+                    file_paths, event_emitter
+                )
                 if ocr_results:
                     file_texts = [
                         result.get("anonymized_text_raw", "")
@@ -285,7 +303,9 @@ class Filter:
                 }
             )
 
-            response = await self._anonymize_text(content_to_anonymize)
+            response = await self._anonymize_text(
+                content_to_anonymize, self.valves.language
+            )
             logging.warn(f"Anymize.ai JobID: {response['job_id']}")
             result = await self._poll_status(response["job_id"])
 
