@@ -52,6 +52,13 @@ from typing import Any, Dict, Optional
 # filter in Open WebUI does not stack wrapper upon wrapper.
 _PATCH_FLAG = "_hook_logger_wrapped"
 
+# Where a patch keeps the function it replaced. Open WebUI re-execs the whole
+# function module whenever its valves are edited, and the patch installed by
+# the previous module object stays in place — with wrappers that read the
+# valves of the previous instance. So a patch is never skipped, it is rebuilt
+# from this attribute: the new module takes over, the old one falls away.
+_PATCH_ORIGINAL = "_hook_logger_original"
+
 # Keys under which the tool registry of get_tools() stores the callable. Which
 # one is used depends on the Open WebUI version.
 _TOOL_CALLABLE_KEYS = ("callable", "tool")
@@ -205,12 +212,14 @@ def _install_get_tools_patch() -> bool:
         logging.warning(f"hook_logger: no tool interception ({e})")
         return False
 
-    original = getattr(middleware, "get_tools", None)
-    if original is None:
+    installed = getattr(middleware, "get_tools", None)
+    if installed is None:
         logging.warning("hook_logger: middleware.get_tools not found, no interception")
         return False
-    if getattr(original, _PATCH_FLAG, False):
-        return True
+
+    # Rebuild from the untouched function, so a patch of an earlier module
+    # object is replaced instead of wrapped a second time.
+    original = getattr(installed, _PATCH_ORIGINAL, installed)
 
     if inspect.iscoroutinefunction(original):
 
@@ -225,6 +234,7 @@ def _install_get_tools_patch() -> bool:
             return _wrap_tool_registry(original(*args, **kwargs))
 
     setattr(patched, _PATCH_FLAG, True)
+    setattr(patched, _PATCH_ORIGINAL, original)
     middleware.get_tools = patched
     return True
 
@@ -246,12 +256,11 @@ def _install_get_updated_tool_function_patch() -> bool:
             logging.warning(f"hook_logger: cannot patch {module_name} ({e})")
             continue
 
-        original = getattr(module, "get_updated_tool_function", None)
-        if original is None:
+        installed = getattr(module, "get_updated_tool_function", None)
+        if installed is None:
             continue
-        if getattr(original, _PATCH_FLAG, False):
-            patched_any = True
-            continue
+
+        original = getattr(installed, _PATCH_ORIGINAL, installed)
 
         @functools.wraps(original)
         async def patched(function, extra_params, _original=original):
@@ -261,6 +270,7 @@ def _install_get_updated_tool_function_patch() -> bool:
             return _wrap_tool_callable(_tool_name_for(resolved), resolved)
 
         setattr(patched, _PATCH_FLAG, True)
+        setattr(patched, _PATCH_ORIGINAL, original)
         setattr(module, "get_updated_tool_function", patched)
         patched_any = True
 
