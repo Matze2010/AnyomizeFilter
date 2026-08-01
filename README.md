@@ -165,8 +165,6 @@ Stand der aktuellen Fassung von `anymize.py` (Version 1.0.0):
 - **Nur die letzte User-Message wird anonymisiert**: Ältere Nachrichten des Verlaufs gehen unverändert ans LLM. In laufenden Unterhaltungen können frühere Klartext-PII also weiterhin mitgeschickt werden.
 - **Job-ID im Log**: `logging.warning(f"Anymize.ai JobID: …")` ([anymize.py:362](anymize.py:362)) schreibt die Job-ID jeder Anonymisierung auf Warn-Level ins Serverlog.
 - **`__metadata__` ist nicht in jedem Aufrufpfad garantiert**: Laut Open-WebUI-Doku läuft `outlet()` bei WebUI-Requests und über `/api/chat/completed`; für direkte Aufrufe von `/api/chat/completions` braucht es `ENABLE_API_OUTLET_FILTERS` auf `dev`/kommenden Releases. In Pfaden ohne Metadata stehen die Hash-Paare nur im Log, nicht im Dict.
-- **Ungenutzte Importe**: `re` und `requests` werden importiert, aber nirgends verwendet.
-- **`output_filter = "anonymized"`** lässt die Platzhalter dauerhaft in der Anzeige stehen — das ist so gewollt, überrascht aber, wenn der Wert versehentlich gesetzt ist.
 
 ---
 
