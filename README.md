@@ -35,6 +35,12 @@ sequenceDiagram
     F-->>OWUI: letzte User-Message ersetzt durch maskierten Text
     OWUI->>LLM: Prompt mit [[Typ-HASH]]-Platzhaltern
     LLM-->>OWUI: Antwort mit Platzhaltern
+    opt Streaming
+        loop je Chunk
+            OWUI->>F: stream(event)
+            F-->>OWUI: event unverändert (nur Logging)
+        end
+    end
     OWUI->>F: outlet(body)
     opt output_filter = deanonymized
         F->>A: POST /api/deanonymize
@@ -51,9 +57,10 @@ sequenceDiagram
 4. **Anonymisierung** (Modi `text_anonymization`, `text_file_anonymization`): der kombinierte Inhalt geht mit der konfigurierten Sprache an `POST /api/anonymize`, die zurückgegebene `job_id` wird über `GET /api/status/{job_id}` gepollt. Der von der API gelieferte `systemprompt` (Regeln zum korrekten Umgang mit Platzhaltern) wird an den Inhalt angehängt. Anschließend holt `_store_hash_pairs()` über `GET /api/status/{job_id}/strings` die vollständige Zuordnungstabelle, legt sie für spätere Nachbearbeitung in `__metadata__` ab und schreibt sie per `logging.warning` ins Serverlog (siehe [Datenschutz-Hinweis](#datenschutz-hinweis)).
 5. **Pfadwahl**: ist eine der Kategorie-Valves gesetzt (`local_processing`) **und** liegen Hash-Paare vor, wird `final_content` lokal über `_anonymize_locally()` aus der Zuordnungstabelle gebildet; sonst ist es `anonymized_text_raw` der API — auch bei aktivem ZDR, wo es keine Paare gibt. Der `systemprompt` wird in beiden Fällen angehängt.
 6. **Ersetzen**: die letzte User-Message im `body` wird durch `final_content` überschrieben. Open WebUI schickt sie so ans Modell. Auf dem API-Pfad sieht das LLM nur Platzhalter; auf dem lokalen Pfad nur so weit, wie die Kategorie-Valves reichen.
-7. **`outlet()`** wird nach der LLM-Antwort gerufen. Bei `output_filter = "deanonymized"` geht die Assistant-Nachricht an `POST /api/deanonymize`; das Ergebnis ersetzt die Antwort im Chat. Bei `"anonymized"` bleibt sie unverändert, die Platzhalter bleiben sichtbar.
-8. **Statusmeldungen** („Processing files…", „Anonymizing content…", „De-anonymizing content…") laufen über `__event_emitter__` und erscheinen im Chat-Verlauf.
-9. **Fehler**: `inlet()` meldet `❌ Anonymization failed: …` und wirft eine Exception — die Anfrage geht nicht ans LLM. `outlet()` wirft nicht, sondern stellt der Originalantwort die Fehlermeldung voran, damit die Antwort nicht verloren geht.
+7. **`stream()`** wird bei aktivem Streaming für jeden Chunk der Antwort gerufen. Der Hook ist ein Prototyp: er gibt das `event` unverändert zurück und schreibt nur eine Log-Zeile je Aufruf (siehe [Datenschutz-Hinweis](#datenschutz-hinweis)). Der Chunk-Zähler liegt in `__metadata__`, nicht auf der Filter-Instanz.
+8. **`outlet()`** wird nach der LLM-Antwort gerufen. Bei `output_filter = "deanonymized"` geht die Assistant-Nachricht an `POST /api/deanonymize`; das Ergebnis ersetzt die Antwort im Chat. Bei `"anonymized"` bleibt sie unverändert, die Platzhalter bleiben sichtbar.
+9. **Statusmeldungen** („Processing files…", „Anonymizing content…", „De-anonymizing content…") laufen über `__event_emitter__` und erscheinen im Chat-Verlauf.
+10. **Fehler**: `inlet()` meldet `❌ Anonymization failed: …` und wirft eine Exception — die Anfrage geht nicht ans LLM. `outlet()` wirft nicht, sondern stellt der Originalantwort die Fehlermeldung voran, damit die Antwort nicht verloren geht.
 
 ---
 
@@ -102,11 +109,11 @@ Basis-URL: `https://app.anymize.ai`, Auth über `Authorization: Bearer <api_key>
 
 | Endpoint | Zweck | Aufruf im Code |
 |---|---|---|
-| `POST /api/anonymize` | Text maskieren, liefert `job_id` | [`_anonymize_text()`](anymize.py:169) |
-| `GET /api/status/{job_id}` | Job-Status + `anonymized_text_raw` + `systemprompt` | [`_get_anonymization_status()`](anymize.py:178) |
-| `GET /api/status/{job_id}/strings` | Zuordnungstabelle Platzhalter ↔ Originalwert; wird in `__metadata__` abgelegt und ins Serverlog geschrieben | [`_get_hash_pairs()`](anymize.py:182), [`_store_hash_pairs()`](anymize.py:186) |
-| `POST /api/deanonymize` | Platzhalter zurück in Originalwerte | [`_deanonymize_text()`](anymize.py:277) |
-| `POST /api/ocr` | Datei (PDF, PNG, JPG, TIFF) per multipart, OCR + Anonymisierung | [`upload_file_from_path_for_ocr()`](anymize.py:286) |
+| `POST /api/anonymize` | Text maskieren, liefert `job_id` | [`_anonymize_text()`](anymize.py:172) |
+| `GET /api/status/{job_id}` | Job-Status + `anonymized_text_raw` + `systemprompt` | [`_get_anonymization_status()`](anymize.py:181) |
+| `GET /api/status/{job_id}/strings` | Zuordnungstabelle Platzhalter ↔ Originalwert; wird in `__metadata__` abgelegt und ins Serverlog geschrieben | [`_get_hash_pairs()`](anymize.py:185), [`_store_hash_pairs()`](anymize.py:189) |
+| `POST /api/deanonymize` | Platzhalter zurück in Originalwerte | [`_deanonymize_text()`](anymize.py:280) |
+| `POST /api/ocr` | Datei (PDF, PNG, JPG, TIFF) per multipart, OCR + Anonymisierung | [`upload_file_from_path_for_ocr()`](anymize.py:289) |
 
 Details zu Parametern und Antwortformaten: [`anymize_api.md`](anymize_api.md) bzw. <https://app.anymize.ai/api-docs/anonymization>.
 
@@ -128,7 +135,7 @@ Alles in `class Filter` in [`anymize.py`](anymize.py):
 | Job-Polling | `_poll_status()` — pollt bis `status == "completed"`, `max_retries=150`, `retry_interval=10000` ms |
 | Datei-Handling | `get_file_paths()`, `process_multiple_files_for_ocr()` — Upload und Polling parallel via `asyncio.gather()` |
 | Orchestrierung | `process_input()` — sammelt Inhalte, ruft die Anonymisierung, überschreibt die letzte User-Message |
-| Open-WebUI-Hooks | `inlet()` (vor dem LLM), `outlet()` (nach dem LLM) — beide mit `__metadata__` |
+| Open-WebUI-Hooks | `inlet()` (vor dem LLM), `stream()` (je Chunk, nur Logging), `outlet()` (nach dem LLM) — alle mit `__metadata__` |
 
 ### Hash-Paare in `__metadata__`
 
@@ -138,6 +145,7 @@ Alles in `class Filter` in [`anymize.py`](anymize.py):
 |---|---|
 | `_anymize_hash_pairs` | `List[Dict[str, Any]]` — ein Dict je erkannter Entität |
 | `_anymize_job_id` | `str` — Job-ID der zugehörigen Anonymisierung |
+| `_anymize_stream_chunks` | `int` — Zähler der `stream()`-Aufrufe dieses Requests |
 
 Zugriff in `outlet()`:
 
@@ -236,10 +244,10 @@ Welcher Pfad gegriffen hat, steht in jedem Fall im Log:
 
 Stand der aktuellen Fassung von `anymize.py` (Version 1.0.0):
 
-- **Langes blockierendes Polling**: `_poll_status()` versucht es bis zu 150-mal im Abstand von 10 s ([anymize.py:153](anymize.py:153)) — im Extremfall hängt eine Anfrage 25 Minuten, bevor der Timeout greift.
-- **Kein Streaming-Support**: `outlet()` arbeitet auf der fertigen Nachricht. Bei aktivem Streaming sieht der Nutzer während der Ausgabe die rohen Platzhalter; erst am Ende wird ersetzt.
+- **Langes blockierendes Polling**: `_poll_status()` versucht es bis zu 150-mal im Abstand von 10 s ([anymize.py:156](anymize.py:156)) — im Extremfall hängt eine Anfrage 25 Minuten, bevor der Timeout greift.
+- **Keine Streaming-De-Anonymisierung**: `stream()` existiert, ersetzt aber nichts — es protokolliert nur. Die De-Anonymisierung bleibt in `outlet()` auf der fertigen Nachricht, der Nutzer sieht während der Ausgabe weiterhin die rohen Platzhalter.
 - **Nur die letzte User-Message wird anonymisiert**: Ältere Nachrichten des Verlaufs gehen unverändert ans LLM. In laufenden Unterhaltungen können frühere Klartext-PII also weiterhin mitgeschickt werden.
-- **Job-ID im Log**: `logging.warning(f"Anymize.ai JobID: …")` ([anymize.py:456](anymize.py:456)) schreibt die Job-ID jeder Anonymisierung auf Warn-Level ins Serverlog.
+- **Job-ID im Log**: `logging.warning(f"Anymize.ai JobID: …")` ([anymize.py:459](anymize.py:459)) schreibt die Job-ID jeder Anonymisierung auf Warn-Level ins Serverlog.
 - **`__metadata__` ist nicht in jedem Aufrufpfad garantiert**: Laut Open-WebUI-Doku läuft `outlet()` bei WebUI-Requests und über `/api/chat/completed`; für direkte Aufrufe von `/api/chat/completions` braucht es `ENABLE_API_OUTLET_FILTERS` auf `dev`/kommenden Releases. In Pfaden ohne Metadata stehen die Hash-Paare nur im Log, nicht im Dict.
 - **Der lokale Pfad maskiert weniger als die API**: Ist eine Kategorie-Valve gesetzt, ersetzt der Filter nur, was in der gefilterten Zuordnungstabelle steht. Fehlen Paare ganz (ZDR), greift der API-Text; filtern die Valves dagegen alle vorhandenen Paare weg, geht die Original-Nachricht im Klartext ans LLM — mit Warnung im Log, ohne Abbruch. Siehe [Auswahl des Pfads](#auswahl-des-pfads).
 
@@ -250,6 +258,8 @@ Stand der aktuellen Fassung von `anymize.py` (Version 1.0.0):
 Der Filter schickt Chat-Inhalte und hochgeladene Dateien an `app.anymize.ai` — die Daten verlassen also die eigene Infrastruktur, bevor sie maskiert sind. Das ist bauartbedingt: die Erkennung der PII passiert bei anymize.ai, nicht lokal. Ob das zulässig ist, hängt vom Einsatzzweck und der vertraglichen Grundlage (Auftragsverarbeitung) ab.
 
 **Die Zuordnungstabelle landet im Log**: Nach jeder Text-Anonymisierung ruft `_store_hash_pairs()` die Hash-Paare ab und schreibt sie per `logging.warning` ins Open-WebUI-Serverlog — inklusive der Originalwerte im Klartext (`original='Max Mustermann'`). Die PII steht damit unmaskiert an einer Stelle, die der Filter sonst gerade schützt; wer Logs weiterleitet, aggregiert oder langfristig aufbewahrt, sollte das einkalkulieren. Abschalten geht nur durch Entfernen des Aufrufs in `process_input()`.
+
+**Bei Streaming landet die gesamte Antwort im Log**: `stream()` schreibt je Chunk eine `logging.warning`-Zeile mit dem vollständigen `event` — bei einer längeren Antwort sind das hunderte Zeilen, die zusammengesetzt den kompletten Text ergeben. Zum Streaming-Zeitpunkt stehen darin noch die Platzhalter; zusammen mit der ebenfalls geloggten Zuordnungstabelle lässt sich die Antwort im Klartext rekonstruieren. Abschalten geht nur durch Entfernen der Log-Zeile in `stream()`.
 
 Die zweite Kopie in `__metadata__` ist dagegen auf den einzelnen Request begrenzt und wird mit ihm verworfen — kein geteilter Zustand zwischen Nutzern oder Chats.
 

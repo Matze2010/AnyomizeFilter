@@ -32,6 +32,9 @@ class Filter:
     METADATA_HASH_PAIRS_KEY = "_anymize_hash_pairs"
     METADATA_JOB_ID_KEY = "_anymize_job_id"
 
+    # Chunk counter of stream(), kept per request next to the hash pairs
+    METADATA_STREAM_CHUNKS_KEY = "_anymize_stream_chunks"
+
     # Field of a hash pair that carries the full token as it appears in the
     # anonymized text, e.g. "[[internal_id-S28MBV]]"
     HASH_PAIR_REPLACEMENT_FIELD = "placeholder"
@@ -554,6 +557,42 @@ class Filter:
             )
 
             raise Exception(f"Anonymization failed: {str(e)}")
+
+    async def stream(
+        self,
+        event: dict,
+        __event_emitter__=None,
+        __metadata__: Optional[Dict[str, Any]] = None,
+        __user__: Optional[Dict[str, Any]] = None,
+    ) -> dict:
+        """Log every chunk of a streamed response and pass it through untouched.
+
+        Prototype: this hook observes only. De-anonymization still happens in
+        outlet() on the finished message. Every parameter but the event has a
+        default because it is not guaranteed which extras Open WebUI injects
+        on the stream path.
+        """
+
+        if not self.toggle:
+            return event
+
+        try:
+            # The counter lives in __metadata__, not on the instance: Open WebUI
+            # shares one Filter across all users and chats, so instance state
+            # would mix up concurrent responses.
+            chunk = "?"
+            if __metadata__ is not None:
+                chunk = __metadata__.get(self.METADATA_STREAM_CHUNKS_KEY, 0) + 1
+                __metadata__[self.METADATA_STREAM_CHUNKS_KEY] = chunk
+
+            logging.warning(f"Anymize.ai stream chunk {chunk}: {event!r}")
+
+        except Exception as e:
+            # Never raise from here — an exception would tear down the response
+            # mid-stream, and this hook only observes.
+            logging.warning(f"Anymize.ai stream logging failed: {e}")
+
+        return event
 
     async def outlet(
         self,
