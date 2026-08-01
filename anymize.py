@@ -8,8 +8,6 @@ version: 1.0.0
 import asyncio
 import aiohttp
 import os
-import re
-import requests
 import logging
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, List, Any
