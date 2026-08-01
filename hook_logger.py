@@ -8,6 +8,7 @@ description: Loggt jeden Aufruf von inlet(), stream(), outlet() und jedes Tool-E
 import functools
 import inspect
 import logging
+import weakref
 from pydantic import BaseModel, Field
 from typing import Any, Dict, Optional
 
@@ -20,14 +21,31 @@ from typing import Any, Dict, Optional
 # the model again without re-entering the filter chain; on the legacy path the
 # result is injected as context after inlet() already ran.
 #
-# The only place both paths share is get_tools(), which hands out the callables
-# that middleware.py invokes. Wrapping those callables makes every tool call
-# and every tool result observable.
+# Two functions are patched, because neither covers all tools on its own:
+#
+#   get_updated_tool_function(function, extra_params)
+#       Called by middleware right before a tool runs on the native function
+#       calling path. It rebuilds the callable from function.__function__ and
+#       function.__extra_params__, which means a wrapper placed anywhere
+#       earlier is discarded — functools.wraps copies exactly those two
+#       attributes along, so the rebuild finds them and starts over from the
+#       original. Wrapping its return value is therefore the only wrapper that
+#       survives, and it is also the one place where MCP tools show up: their
+#       registry entries are built inside middleware and never pass get_tools.
+#
+#   get_tools(request, tool_ids, user, extra_params)
+#       Hands out the callables of the plugin tools. On the legacy function
+#       calling path middleware calls those directly, without asking
+#       get_updated_tool_function first, so they have to be wrapped here. This
+#       is also where tool names are learned for the log lines.
+#
+# Not covered: tools of direct tool servers (entries with direct=True). Open
+# WebUI executes them in the browser through an event, so nothing runs
+# server-side that could be wrapped.
 #
 # PROTOTYPE. This is a monkey patch of Open WebUI internals and can break on
-# any upgrade — the name of the tool registry key in particular differs between
-# versions. It observes only; tool arguments, results and exceptions are passed
-# through untouched.
+# any upgrade. It observes only; tool arguments, results and exceptions are
+# passed through untouched.
 # --------------------------------------------------------------------------
 
 # Marks a function this module has already wrapped, so that reloading the
@@ -37,6 +55,12 @@ _PATCH_FLAG = "_hook_logger_wrapped"
 # Keys under which the tool registry of get_tools() stores the callable. Which
 # one is used depends on the Open WebUI version.
 _TOOL_CALLABLE_KEYS = ("callable", "tool")
+
+# Tool callable -> tool name, learned from the registry of get_tools(). The
+# callable middleware finally invokes is rebuilt and therefore a different
+# object, so the original under __function__ is registered as well. Weak keys:
+# the map must not keep tool modules alive across reloads.
+_tool_names: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 
 # The Filter instance whose valves the tool wrappers read. Open WebUI keeps one
 # instance per function, and the wrappers live outside the class, so the
@@ -65,6 +89,34 @@ def _describe_result(result: Any) -> str:
         return f"type={type(result).__name__}{size}"
     except Exception:
         return f"type={type(result).__name__}"
+
+
+def _register_tool_name(fn, name: str) -> None:
+    """Remember the name of a tool callable and of the original behind it."""
+
+    for candidate in (fn, getattr(fn, "__function__", None)):
+        if candidate is None:
+            continue
+        try:
+            _tool_names[candidate] = name
+        except TypeError:
+            # Not weak-referenceable, e.g. a builtin. Nothing to remember.
+            pass
+
+
+def _tool_name_for(fn) -> str:
+    """Best known name of a tool callable, for the log line."""
+
+    for candidate in (fn, getattr(fn, "__function__", None)):
+        if candidate is None:
+            continue
+        try:
+            if candidate in _tool_names:
+                return _tool_names[candidate]
+        except TypeError:
+            pass
+
+    return getattr(fn, "__name__", None) or "?"
 
 
 def _wrap_tool_callable(name: str, fn):
@@ -129,7 +181,10 @@ def _wrap_tool_registry(tools: Any) -> Any:
                 continue
             for key in _TOOL_CALLABLE_KEYS:
                 fn = entry.get(key)
-                if callable(fn) and not getattr(fn, _PATCH_FLAG, False):
+                if not callable(fn):
+                    continue
+                _register_tool_name(fn, name)
+                if not getattr(fn, _PATCH_FLAG, False):
                     entry[key] = _wrap_tool_callable(name, fn)
     except Exception as e:
         # A broken registry must not break tool calling.
@@ -171,8 +226,66 @@ def _install_get_tools_patch() -> bool:
 
     setattr(patched, _PATCH_FLAG, True)
     middleware.get_tools = patched
-    logging.warning("hook_logger: tool interception installed")
     return True
+
+
+def _install_get_updated_tool_function_patch() -> bool:
+    """Wrap the callable middleware runs on the native path. Idempotent.
+
+    This has to patch the last step before the call: get_updated_tool_function
+    rebuilds the callable from __function__, so any wrapper installed earlier
+    is gone by the time the tool actually runs.
+    """
+
+    patched_any = False
+
+    for module_name in ("open_webui.utils.middleware", "open_webui.utils.tools"):
+        try:
+            module = __import__(module_name, fromlist=["*"])
+        except Exception as e:
+            logging.warning(f"hook_logger: cannot patch {module_name} ({e})")
+            continue
+
+        original = getattr(module, "get_updated_tool_function", None)
+        if original is None:
+            continue
+        if getattr(original, _PATCH_FLAG, False):
+            patched_any = True
+            continue
+
+        @functools.wraps(original)
+        async def patched(function, extra_params, _original=original):
+            resolved = await _original(function, extra_params)
+            if not callable(resolved) or getattr(resolved, _PATCH_FLAG, False):
+                return resolved
+            return _wrap_tool_callable(_tool_name_for(resolved), resolved)
+
+        setattr(patched, _PATCH_FLAG, True)
+        setattr(module, "get_updated_tool_function", patched)
+        patched_any = True
+
+    return patched_any
+
+
+def _install_tool_patches() -> None:
+    """Install both patches and report in the log what is covered."""
+
+    try:
+        via_get_tools = _install_get_tools_patch()
+        via_updated = _install_get_updated_tool_function_patch()
+    except Exception as e:
+        logging.warning(f"hook_logger: tool interception failed ({e})")
+        return
+
+    logging.warning(
+        "hook_logger: tool interception installed "
+        f"(get_tools={via_get_tools}, get_updated_tool_function={via_updated})"
+    )
+    if not via_updated:
+        logging.warning(
+            "hook_logger: get_updated_tool_function not found — native function "
+            "calling and MCP tools will not be logged on this Open WebUI version"
+        )
 
 
 class Filter:
@@ -219,7 +332,7 @@ class Filter:
 
         # The tool wrappers live at module level and read the valves from here.
         _active_filter = self
-        _install_get_tools_patch()
+        _install_tool_patches()
 
     def _log(
         self,
