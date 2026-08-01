@@ -128,6 +128,33 @@ class Filter:
 
         return await self._anymize_api_request("GET", f"/api/status/{job_id}")
 
+    async def _get_hash_pairs(self, job_id: str) -> Dict[str, Any]:
+
+        return await self._anymize_api_request("GET", f"/api/status/{job_id}/strings")
+
+    async def _log_hash_pairs(self, job_id: str) -> None:
+
+        try:
+            response = await self._get_hash_pairs(job_id)
+            hash_pairs = response.get("hash_pairs", [])
+
+            if not hash_pairs:
+                logging.warning(
+                    f"Anymize.ai hash pairs for job {job_id}: none returned"
+                )
+                return
+
+            pairs = "\n".join(
+                f"  {pair.get('hash')} -> {pair.get('original')}"
+                for pair in hash_pairs
+            )
+            logging.warning(
+                f"Anymize.ai hash pairs for job {job_id} "
+                f"({response.get('total', len(hash_pairs))} entries):\n{pairs}"
+            )
+        except Exception as e:
+            logging.warning(f"Anymize.ai hash pairs for job {job_id} unavailable: {e}")
+
     async def _deanonymize_text(self, text: str) -> Dict[str, Any]:
 
         body = {
@@ -306,8 +333,9 @@ class Filter:
             response = await self._anonymize_text(
                 content_to_anonymize, self.valves.language
             )
-            logging.warn(f"Anymize.ai JobID: {response['job_id']}")
+            logging.warning(f"Anymize.ai JobID: {response['job_id']}")
             result = await self._poll_status(response["job_id"])
+            await self._log_hash_pairs(response["job_id"])
 
             # Combine anonymized content with system prompt
             final_content = result["anonymized_text_raw"]
