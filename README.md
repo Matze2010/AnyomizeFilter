@@ -49,8 +49,8 @@ sequenceDiagram
 2. **Dateien** (Modi `file_anonymization`, `text_file_anonymization`): `get_file_paths()` baut aus `body["files"]` die Pfade `UPLOAD_DIR/{file_id}_{filename}`. `process_multiple_files_for_ocr()` lädt alle Dateien parallel an `POST /api/ocr` hoch — zusammen mit der in der Valve `language` gesetzten Sprache —, sammelt die Job-IDs und pollt sie parallel bis `status == "completed"`. Ergebnis: `anonymized_text_raw` je Datei.
 3. **Text**: der Text der letzten User-Message wird an den OCR-Text angehängt.
 4. **Anonymisierung** (Modi `text_anonymization`, `text_file_anonymization`): der kombinierte Inhalt geht mit der konfigurierten Sprache an `POST /api/anonymize`, die zurückgegebene `job_id` wird über `GET /api/status/{job_id}` gepollt. Der von der API gelieferte `systemprompt` (Regeln zum korrekten Umgang mit Platzhaltern) wird an den Inhalt angehängt. Anschließend holt `_store_hash_pairs()` über `GET /api/status/{job_id}/strings` die vollständige Zuordnungstabelle, legt sie für spätere Nachbearbeitung in `__metadata__` ab und schreibt sie per `logging.warning` ins Serverlog (siehe [Datenschutz-Hinweis](#datenschutz-hinweis)).
-5. **Gegenprobe**: `_anonymize_locally()` wendet die Zuordnungstabelle lokal auf den Originaltext an — jedes `original` wird durch das zugehörige `placeholder` ersetzt — und `_compare_local_anonymization()` vergleicht das Ergebnis mit `anonymized_text_raw` der API. Bei Ungleichheit geht eine `logging.warning` ins Serverlog. Rein diagnostisch: ans LLM geht in jedem Fall der API-Text.
-6. **Ersetzen**: die letzte User-Message im `body` wird durch den maskierten Inhalt überschrieben. Open WebUI schickt sie so ans Modell — das LLM sieht nur Platzhalter.
+5. **Pfadwahl**: ist eine der Kategorie-Valves gesetzt (`local_processing`) **und** liegen Hash-Paare vor, wird `final_content` lokal über `_anonymize_locally()` aus der Zuordnungstabelle gebildet; sonst ist es `anonymized_text_raw` der API — auch bei aktivem ZDR, wo es keine Paare gibt. Der `systemprompt` wird in beiden Fällen angehängt.
+6. **Ersetzen**: die letzte User-Message im `body` wird durch `final_content` überschrieben. Open WebUI schickt sie so ans Modell. Auf dem API-Pfad sieht das LLM nur Platzhalter; auf dem lokalen Pfad nur so weit, wie die Kategorie-Valves reichen.
 7. **`outlet()`** wird nach der LLM-Antwort gerufen. Bei `output_filter = "deanonymized"` geht die Assistant-Nachricht an `POST /api/deanonymize`; das Ergebnis ersetzt die Antwort im Chat. Bei `"anonymized"` bleibt sie unverändert, die Platzhalter bleiben sichtbar.
 8. **Statusmeldungen** („Processing files…", „Anonymizing content…", „De-anonymizing content…") laufen über `__event_emitter__` und erscheinen im Chat-Verlauf.
 9. **Fehler**: `inlet()` meldet `❌ Anonymization failed: …` und wirft eine Exception — die Anfrage geht nicht ans LLM. `outlet()` wirft nicht, sondern stellt der Originalantwort die Fehlermeldung voran, damit die Antwort nicht verloren geht.
@@ -75,6 +75,8 @@ sequenceDiagram
 | `language` | `de` | Sprache der PII-Erkennung; gilt für `/api/anonymize` **und** `/api/ocr`. Mögliche Werte: `de`, `en`, `fr`, `es`, `it`. |
 | `input_filter` | `text_anonymization` | Was vor dem LLM verarbeitet wird — siehe Modi unten. |
 | `output_filter` | `deanonymized` | Was mit der LLM-Antwort passiert — siehe unten. |
+| `allowed_categories` | `""` | Kommagetrennte PII-Kategorien, die maskiert werden. Leer = alle. ⚠️ Gesetzt schaltet die Anonymisierung auf den [lokalen Pfad](#lokale-anonymisierung) um; alles außerhalb dieser Kategorien geht im Klartext ans LLM. |
+| `disallowed_categories` | `""` | Kommagetrennte PII-Kategorien, die **nicht** maskiert werden. Sticht `allowed_categories`. ⚠️ Gesetzt schaltet ebenfalls auf den lokalen Pfad um; Werte dieser Kategorien gehen im Klartext ans LLM. |
 | `priority` | `10` | Ausführungsreihenfolge unter mehreren Filtern; kleinere Werte laufen zuerst. |
 
 ### `input_filter`-Modi
@@ -100,11 +102,11 @@ Basis-URL: `https://app.anymize.ai`, Auth über `Authorization: Bearer <api_key>
 
 | Endpoint | Zweck | Aufruf im Code |
 |---|---|---|
-| `POST /api/anonymize` | Text maskieren, liefert `job_id` | [`_anonymize_text()`](anymize.py:139) |
-| `GET /api/status/{job_id}` | Job-Status + `anonymized_text_raw` + `systemprompt` | [`_get_anonymization_status()`](anymize.py:148) |
-| `GET /api/status/{job_id}/strings` | Zuordnungstabelle Platzhalter ↔ Originalwert; wird in `__metadata__` abgelegt und ins Serverlog geschrieben | [`_get_hash_pairs()`](anymize.py:152), [`_store_hash_pairs()`](anymize.py:156) |
-| `POST /api/deanonymize` | Platzhalter zurück in Originalwerte | [`_deanonymize_text()`](anymize.py:237) |
-| `POST /api/ocr` | Datei (PDF, PNG, JPG, TIFF) per multipart, OCR + Anonymisierung | [`upload_file_from_path_for_ocr()`](anymize.py:246) |
+| `POST /api/anonymize` | Text maskieren, liefert `job_id` | [`_anonymize_text()`](anymize.py:169) |
+| `GET /api/status/{job_id}` | Job-Status + `anonymized_text_raw` + `systemprompt` | [`_get_anonymization_status()`](anymize.py:178) |
+| `GET /api/status/{job_id}/strings` | Zuordnungstabelle Platzhalter ↔ Originalwert; wird in `__metadata__` abgelegt und ins Serverlog geschrieben | [`_get_hash_pairs()`](anymize.py:182), [`_store_hash_pairs()`](anymize.py:186) |
+| `POST /api/deanonymize` | Platzhalter zurück in Originalwerte | [`_deanonymize_text()`](anymize.py:277) |
+| `POST /api/ocr` | Datei (PDF, PNG, JPG, TIFF) per multipart, OCR + Anonymisierung | [`upload_file_from_path_for_ocr()`](anymize.py:286) |
 
 Details zu Parametern und Antwortformaten: [`anymize_api.md`](anymize_api.md) bzw. <https://app.anymize.ai/api-docs/anonymization>.
 
@@ -118,9 +120,9 @@ Alles in `class Filter` in [`anymize.py`](anymize.py):
 
 | Gruppe | Methoden |
 |---|---|
-| Konfiguration | `Valves` (pydantic-Model), `__init__()` — setzt `toggle` und das Inline-SVG-Icon |
+| Konfiguration | `Valves` (pydantic-Model), `__init__()` — setzt `toggle` und das Inline-SVG-Icon, `local_processing` (Property) — `True`, sobald eine der beiden Kategorie-Valves gesetzt ist |
 | Zuordnungstabelle | `_get_hash_pairs()`, `_store_hash_pairs()` — Abruf, Ablage in `__metadata__`, Logging |
-| Gegenprobe | `_anonymize_locally()`, `_compare_local_anonymization()` — lokale Anonymisierung anhand der Tabelle, Vergleich mit dem API-Ergebnis |
+| Lokale Anonymisierung | `_parse_categories()`, `_filter_hash_pairs()`, `_anonymize_locally()` — Kategorie-Filter und Ersetzung anhand der Tabelle; aktiv, sobald `local_processing` `True` ist |
 | HTTP | `_anymize_api_request()` — aiohttp-Wrapper für GET/POST mit Bearer-Auth |
 | API-Calls | `_anonymize_text()`, `_get_anonymization_status()`, `_deanonymize_text()`, `upload_file_from_path_for_ocr()` |
 | Job-Polling | `_poll_status()` — pollt bis `status == "completed"`, `max_retries=150`, `retry_interval=10000` ms |
@@ -166,20 +168,58 @@ Eine reale Antwort von `GET /api/status/{job_id}/strings` sieht so aus:
 
 `placeholder` trägt das vollständige Token in der Form, in der es im maskierten Text steht, `hash` nur den nackten Code. Die Beispiele in [`anymize_api.md`](anymize_api.md) (`placeholder: "PERSON-1"`, `hash: "[PERSON-1]"`) geben das nicht wieder — sie sind veraltet.
 
-### Lokale Gegenprobe
+### Lokale Anonymisierung
 
-`_anonymize_locally()` wendet die Zuordnungstabelle selbst auf den Originaltext an: jedes `original` wird durch das Feld aus `Filter.HASH_PAIR_REPLACEMENT_FIELD` (`placeholder`) ersetzt. Paare, bei denen eines der beiden Felder fehlt, werden übersprungen. Ersetzt wird **absteigend nach Länge des Originalwerts** — sonst würde ein kurzer Wert, der Teilstring eines längeren ist (`Berlin` in `Berliner Str. 42, 10115 Berlin`), den längeren zerschneiden, bevor dieser an die Reihe kommt.
+> ⚠️ **Sobald eine der beiden Kategorie-Valves gesetzt ist, schaltet `process_input()` auf diesen Pfad um**: `final_content` ist dann der lokal maskierte Text, nicht mehr `anonymized_text_raw` der API. Alles, was die Kategorien nicht abdecken, geht im Klartext ans LLM.
 
-`_compare_local_anonymization()` vergleicht das Ergebnis mit `anonymized_text_raw` der API — verglichen wird vor dem Anhängen des `systemprompt`, den der lokale Text nicht enthält. Sind beide gleich, passiert nichts. Sonst geht eine `logging.warning` mit Job-ID, Länge beider Texte, Index der ersten Abweichung und je einem Kontextausschnitt (`Filter.DIFF_CONTEXT_CHARS` = 20 Zeichen je Seite) ins Log:
+`local_processing` ist eine Property, kein in `__init__()` gesetztes Attribut: Open WebUI weist `self.valves` **nach** der Konstruktion zu — und erneut, sobald die Valves im UI geändert werden. Ein in `__init__()` berechneter Wert würde deshalb nur die Defaults sehen und dauerhaft `False` bleiben. Als Property wird bei jedem Zugriff aus den aktuellen Valves gelesen. Reine Leerzeichen oder Kommas zählen dabei nicht als gesetzt, weil `_parse_categories()` sie verwirft.
 
+`_anonymize_locally()` wendet die Zuordnungstabelle lokal auf einen Text an: jedes `original` wird durch das Feld aus `Filter.HASH_PAIR_REPLACEMENT_FIELD` (`placeholder`) ersetzt. Paare, bei denen eines der beiden Felder fehlt, werden übersprungen. Ersetzt wird **absteigend nach Länge des Originalwerts** — sonst würde ein kurzer Wert, der Teilstring eines längeren ist (`Berlin` in `Berliner Str. 42, 10115 Berlin`), den längeren zerschneiden, bevor dieser an die Reihe kommt.
+
+#### Kategorie-Filter
+
+`_filter_hash_pairs()` schränkt vorab ein, welche Paare überhaupt ersetzt werden — anhand des Felds `prefix_name` (die PII-Kategorie, z. B. `person`, `location`, `internal_id`):
+
+| `allowed_categories` | `disallowed_categories` | Wirkung |
+|---|---|---|
+| leer | leer | alle Paare (Standard) |
+| gesetzt | leer | nur die genannten Kategorien |
+| leer | gesetzt | alle außer den genannten |
+| gesetzt | gesetzt | die genannten aus `allowed`, minus `disallowed` — **`disallowed` sticht** |
+
+Beide Listen werden kommagetrennt gelesen, Groß-/Kleinschreibung und umgebende Leerzeichen sind egal, leere Einträge werden ignoriert. Ein Paar ohne `prefix_name` bleibt erhalten, solange keine `allowed`-Liste aktiv ist; mit aktiver Whitelist fällt es raus, weil es keiner erlaubten Kategorie zugeordnet werden kann.
+
+Der Filter wirkt nur auf `_anonymize_locally()`. Was in `__metadata__` liegt und was beim Logging der Zuordnungstabelle geschrieben wird, bleibt unberührt — die API kennt keinen Kategorie-Parameter, sie maskiert immer alles, was sie erkennt.
+
+#### Auswahl des Pfads
+
+In `process_input()`:
+
+```python
+if self.local_processing and hash_pairs:
+    final_content = self._anonymize_locally(content_to_anonymize, hash_pairs)
+else:
+    final_content = result["anonymized_text_raw"]
 ```
-Anymize.ai local anonymization for job <id> differs from the API result:
-local 34 chars, API 37 chars, first difference at index 28
-  local: 'person-AAA111]] aus Berlin'
-  api:   'person-AAA111]] aus [[loc-X]]'
-```
 
-Eine Abweichung heißt: der maskierte Text der API lässt sich mit der gelieferten Tabelle nicht reproduzieren — dann greift auch jede Nachbearbeitung, die auf der Tabelle aufsetzt, ins Leere. Der Vergleich ist rein diagnostisch: ans LLM geht in jedem Fall der API-Text, und Fehler in der Gegenprobe werden abgefangen und geloggt, statt den Request scheitern zu lassen. Ohne Hash-Paare (leere Liste, ZDR aktiv, Abruf fehlgeschlagen) entfällt der Vergleich.
+Der `systemprompt` wird danach auf beiden Pfaden gleich angehängt.
+
+Welcher Pfad gegriffen hat, steht in jedem Fall im Log:
+
+| Fall | Meldung |
+|---|---|
+| lokal maskiert | `anonymized locally from N hash pairs (before category filtering)` |
+| API-Text, keine Valves gesetzt | `using the anonymized text from the API` |
+| API-Text, weil keine Hash-Paare da sind | `no hash pairs available (Zero Data Retention enabled?) — using the anonymized text from the API instead of local anonymization` |
+
+**Rückfall auf den API-Text ohne Hash-Paare**: Zero Data Retention ist eine Kontoeinstellung, kein Request-Parameter — von hier aus sichtbar wird sie nur daran, dass `GET /api/status/{job_id}/strings` nichts liefert, weil anymize.ai unter ZDR keine Zuordnung speichert. Ohne Paare würde der lokale Pfad nichts ersetzen und die Original-Nachricht im Klartext ans Modell schicken; deshalb greift dann der API-Text, begleitet von einer Warnung im Log. Dasselbe gilt, wenn der Abruf der Tabelle fehlgeschlagen ist oder die API keine PII erkannt hat.
+
+⚠️ **Sonst kann der lokale Pfad weiterhin Klartext ans LLM schicken.** Er maskiert nur, was in der gefilterten Zuordnungstabelle steht:
+
+- Werte einer ausgeschlossenen Kategorie bleiben im Klartext stehen — genau das ist der Zweck der Valves, aber es heißt, dass diese PII das Modell erreicht.
+- Filtern die Kategorien **alle** vorhandenen Paare weg, geht die unveränderte Original-Nachricht ans Modell. `process_input()` warnt dann (`replaced nothing — the message goes to the model unmasked`), verhindert den Versand aber nicht.
+
+`_filter_hash_pairs()` protokolliert zusätzlich, sobald es Paare aussortiert.
 
 ---
 
@@ -196,14 +236,12 @@ Eine Abweichung heißt: der maskierte Text der API lässt sich mit der geliefert
 
 Stand der aktuellen Fassung von `anymize.py` (Version 1.0.0):
 
-- **Langes blockierendes Polling**: `_poll_status()` versucht es bis zu 150-mal im Abstand von 10 s ([anymize.py:123](anymize.py:123)) — im Extremfall hängt eine Anfrage 25 Minuten, bevor der Timeout greift.
+- **Langes blockierendes Polling**: `_poll_status()` versucht es bis zu 150-mal im Abstand von 10 s ([anymize.py:153](anymize.py:153)) — im Extremfall hängt eine Anfrage 25 Minuten, bevor der Timeout greift.
 - **Kein Streaming-Support**: `outlet()` arbeitet auf der fertigen Nachricht. Bei aktivem Streaming sieht der Nutzer während der Ausgabe die rohen Platzhalter; erst am Ende wird ersetzt.
 - **Nur die letzte User-Message wird anonymisiert**: Ältere Nachrichten des Verlaufs gehen unverändert ans LLM. In laufenden Unterhaltungen können frühere Klartext-PII also weiterhin mitgeschickt werden.
-- **Job-ID im Log**: `logging.warning(f"Anymize.ai JobID: …")` ([anymize.py:416](anymize.py:416)) schreibt die Job-ID jeder Anonymisierung auf Warn-Level ins Serverlog.
+- **Job-ID im Log**: `logging.warning(f"Anymize.ai JobID: …")` ([anymize.py:456](anymize.py:456)) schreibt die Job-ID jeder Anonymisierung auf Warn-Level ins Serverlog.
 - **`__metadata__` ist nicht in jedem Aufrufpfad garantiert**: Laut Open-WebUI-Doku läuft `outlet()` bei WebUI-Requests und über `/api/chat/completed`; für direkte Aufrufe von `/api/chat/completions` braucht es `ENABLE_API_OUTLET_FILTERS` auf `dev`/kommenden Releases. In Pfaden ohne Metadata stehen die Hash-Paare nur im Log, nicht im Dict.
-- **Grenzen der Gegenprobe**: sie prüft nur, ob sich der maskierte Text der API aus der gelieferten Zuordnungstabelle reproduzieren lässt — **nicht**, ob die API PII übersehen hat. Übersehene PII steht in keiner der beiden Fassungen und fällt damit auch nicht auf.
-- **Ungenutzte Importe**: `re` und `requests` werden importiert, aber nirgends verwendet.
-- **`output_filter = "anonymized"`** lässt die Platzhalter dauerhaft in der Anzeige stehen — das ist so gewollt, überrascht aber, wenn der Wert versehentlich gesetzt ist.
+- **Der lokale Pfad maskiert weniger als die API**: Ist eine Kategorie-Valve gesetzt, ersetzt der Filter nur, was in der gefilterten Zuordnungstabelle steht. Fehlen Paare ganz (ZDR), greift der API-Text; filtern die Valves dagegen alle vorhandenen Paare weg, geht die Original-Nachricht im Klartext ans LLM — mit Warnung im Log, ohne Abbruch. Siehe [Auswahl des Pfads](#auswahl-des-pfads).
 
 ---
 
@@ -213,11 +251,9 @@ Der Filter schickt Chat-Inhalte und hochgeladene Dateien an `app.anymize.ai` —
 
 **Die Zuordnungstabelle landet im Log**: Nach jeder Text-Anonymisierung ruft `_store_hash_pairs()` die Hash-Paare ab und schreibt sie per `logging.warning` ins Open-WebUI-Serverlog — inklusive der Originalwerte im Klartext (`original='Max Mustermann'`). Die PII steht damit unmaskiert an einer Stelle, die der Filter sonst gerade schützt; wer Logs weiterleitet, aggregiert oder langfristig aufbewahrt, sollte das einkalkulieren. Abschalten geht nur durch Entfernen des Aufrufs in `process_input()`.
 
-**Auch die Gegenprobe kann Klartext ins Log schreiben**: Weicht der lokal anonymisierte Text vom API-Ergebnis ab, enthält die Warnung je einen 40-Zeichen-Ausschnitt beider Fassungen. Der lokale Ausschnitt kann PII tragen, die die Tabelle nicht abdeckt — genau der Fall, den die Warnung meldet. Wer das nicht will, setzt `Filter.DIFF_CONTEXT_CHARS = 0` oder entfernt den Aufruf in `process_input()`.
-
 Die zweite Kopie in `__metadata__` ist dagegen auf den einzelnen Request begrenzt und wird mit ihm verworfen — kein geteilter Zustand zwischen Nutzern oder Chats.
 
-Zero Data Retention ist eine Kontoeinstellung bei anymize.ai, kein Request-Parameter. Mit ZDR speichert anymize.ai keine Zuordnung zwischen Platzhalter und Originalwert — dann funktioniert die De-Anonymisierung in `outlet()` nicht mehr.
+Zero Data Retention ist eine Kontoeinstellung bei anymize.ai, kein Request-Parameter. Mit ZDR speichert anymize.ai keine Zuordnung zwischen Platzhalter und Originalwert — dann funktioniert die De-Anonymisierung in `outlet()` nicht mehr, die Zuordnungstabelle landet weder im Log noch in `__metadata__`, und die lokale Anonymisierung fällt auf den API-Text zurück.
 
 ---
 
