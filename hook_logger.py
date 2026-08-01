@@ -1,7 +1,7 @@
 """
 title: hook_logger
 author: Mathias Gisch
-version: 0.2.0
+version: 0.3.0
 description: Loggt jeden Aufruf von inlet(), stream(), outlet() und jedes Tool-Ergebnis, ohne etwas zu verändern.
 """
 
@@ -48,15 +48,20 @@ from typing import Any, Dict, Optional
 # passed through untouched.
 # --------------------------------------------------------------------------
 
+# Logged when the patches are installed. Open WebUI shows no version anywhere,
+# so this is the only way to tell from a log which source is actually running.
+_VERSION = "0.3.0"
+
 # Marks a function this module has already wrapped, so that reloading the
 # filter in Open WebUI does not stack wrapper upon wrapper.
 _PATCH_FLAG = "_hook_logger_wrapped"
 
-# Where a patch keeps the function it replaced. Open WebUI re-execs the whole
-# function module whenever its valves are edited, and the patch installed by
-# the previous module object stays in place — with wrappers that read the
-# valves of the previous instance. So a patch is never skipped, it is rebuilt
-# from this attribute: the new module takes over, the old one falls away.
+# Where a wrapper keeps the function it replaced. Open WebUI re-execs the whole
+# function module whenever its valves are edited or the source is updated, and
+# everything the previous module object installed stays in place — wrappers
+# that read the valves of the previous instance. Nothing is therefore ever
+# skipped because it is "already wrapped": wrappers are peeled off along this
+# attribute first and rebuilt by the module loaded last.
 _PATCH_ORIGINAL = "_hook_logger_original"
 
 # Keys under which the tool registry of get_tools() stores the callable. Which
@@ -96,6 +101,27 @@ def _describe_result(result: Any) -> str:
         return f"type={type(result).__name__}{size}"
     except Exception:
         return f"type={type(result).__name__}"
+
+
+def _unwrap(fn):
+    """Strip wrappers of this module, including those of an older version.
+
+    Versions before this one had no _PATCH_ORIGINAL, but every wrapper is
+    built with functools.wraps, so __wrapped__ leads back to the original
+    there as well.
+    """
+
+    seen = set()
+    while callable(fn) and getattr(fn, _PATCH_FLAG, False):
+        if id(fn) in seen:
+            break
+        seen.add(id(fn))
+        inner = getattr(fn, _PATCH_ORIGINAL, None) or getattr(fn, "__wrapped__", None)
+        if inner is None:
+            break
+        fn = inner
+
+    return fn
 
 
 def _register_tool_name(fn, name: str) -> None:
@@ -176,6 +202,7 @@ def _wrap_tool_callable(name: str, fn):
             return result
 
     setattr(wrapper, _PATCH_FLAG, True)
+    setattr(wrapper, _PATCH_ORIGINAL, fn)
     return wrapper
 
 
@@ -187,12 +214,11 @@ def _wrap_tool_registry(tools: Any) -> Any:
             if not isinstance(entry, dict):
                 continue
             for key in _TOOL_CALLABLE_KEYS:
-                fn = entry.get(key)
+                fn = _unwrap(entry.get(key))
                 if not callable(fn):
                     continue
                 _register_tool_name(fn, name)
-                if not getattr(fn, _PATCH_FLAG, False):
-                    entry[key] = _wrap_tool_callable(name, fn)
+                entry[key] = _wrap_tool_callable(name, fn)
     except Exception as e:
         # A broken registry must not break tool calling.
         logging.warning(f"hook_logger could not wrap tools: {e}")
@@ -219,7 +245,7 @@ def _install_get_tools_patch() -> bool:
 
     # Rebuild from the untouched function, so a patch of an earlier module
     # object is replaced instead of wrapped a second time.
-    original = getattr(installed, _PATCH_ORIGINAL, installed)
+    original = _unwrap(installed)
 
     if inspect.iscoroutinefunction(original):
 
@@ -236,6 +262,8 @@ def _install_get_tools_patch() -> bool:
     setattr(patched, _PATCH_FLAG, True)
     setattr(patched, _PATCH_ORIGINAL, original)
     middleware.get_tools = patched
+    if installed is not original:
+        logging.warning("hook_logger: replaced the get_tools patch of an older version")
     return True
 
 
@@ -260,12 +288,14 @@ def _install_get_updated_tool_function_patch() -> bool:
         if installed is None:
             continue
 
-        original = getattr(installed, _PATCH_ORIGINAL, installed)
+        original = _unwrap(installed)
 
         @functools.wraps(original)
         async def patched(function, extra_params, _original=original):
-            resolved = await _original(function, extra_params)
-            if not callable(resolved) or getattr(resolved, _PATCH_FLAG, False):
+            # Peel off a wrapper of an older module version instead of leaving
+            # it in charge: it would log against the valves of that version.
+            resolved = _unwrap(await _original(_unwrap(function), extra_params))
+            if not callable(resolved):
                 return resolved
             return _wrap_tool_callable(_tool_name_for(resolved), resolved)
 
@@ -273,6 +303,10 @@ def _install_get_updated_tool_function_patch() -> bool:
         setattr(patched, _PATCH_ORIGINAL, original)
         setattr(module, "get_updated_tool_function", patched)
         patched_any = True
+        if installed is not original:
+            logging.warning(
+                f"hook_logger: replaced the {module_name} patch of an older version"
+            )
 
     return patched_any
 
@@ -288,7 +322,7 @@ def _install_tool_patches() -> None:
         return
 
     logging.warning(
-        "hook_logger: tool interception installed "
+        f"hook_logger {_VERSION}: tool interception installed "
         f"(get_tools={via_get_tools}, get_updated_tool_function={via_updated})"
     )
     if not via_updated:
