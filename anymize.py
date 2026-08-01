@@ -21,6 +21,19 @@ logger = logging.getLogger(__name__)
 
 
 class Filter:
+    # Fields kept from each entry of GET /api/status/{job_id}/strings
+    HASH_PAIR_FIELDS = (
+        "original",
+        "hash",
+        "prefix_name",
+        "internal_id",
+        "placeholder",
+    )
+
+    # Keys used to hand the hash pairs from inlet() to outlet() via __metadata__
+    METADATA_HASH_PAIRS_KEY = "_anymize_hash_pairs"
+    METADATA_JOB_ID_KEY = "_anymize_job_id"
+
     class Valves(BaseModel):
         anymize_api_key: str = Field(
             default="",
@@ -132,28 +145,40 @@ class Filter:
 
         return await self._anymize_api_request("GET", f"/api/status/{job_id}/strings")
 
-    async def _log_hash_pairs(self, job_id: str) -> None:
+    async def _store_hash_pairs(
+        self, job_id: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
 
         try:
             response = await self._get_hash_pairs(job_id)
-            hash_pairs = response.get("hash_pairs", [])
-
-            if not hash_pairs:
-                logging.warning(
-                    f"Anymize.ai hash pairs for job {job_id}: none returned"
-                )
-                return
-
-            pairs = "\n".join(
-                f"  {pair.get('hash')} -> {pair.get('original')}"
-                for pair in hash_pairs
-            )
-            logging.warning(
-                f"Anymize.ai hash pairs for job {job_id} "
-                f"({response.get('total', len(hash_pairs))} entries):\n{pairs}"
-            )
         except Exception as e:
             logging.warning(f"Anymize.ai hash pairs for job {job_id} unavailable: {e}")
+            return []
+
+        hash_pairs = [
+            {field: pair.get(field) for field in self.HASH_PAIR_FIELDS}
+            for pair in response.get("hash_pairs", [])
+        ]
+
+        if metadata is not None:
+            metadata[self.METADATA_HASH_PAIRS_KEY] = hash_pairs
+            metadata[self.METADATA_JOB_ID_KEY] = job_id
+
+        if not hash_pairs:
+            logging.warning(f"Anymize.ai hash pairs for job {job_id}: none returned")
+            return hash_pairs
+
+        pairs = "\n".join(
+            "  "
+            + ", ".join(f"{field}={pair[field]!r}" for field in self.HASH_PAIR_FIELDS)
+            for pair in hash_pairs
+        )
+        logging.warning(
+            f"Anymize.ai hash pairs for job {job_id} "
+            f"({response.get('total', len(hash_pairs))} entries):\n{pairs}"
+        )
+
+        return hash_pairs
 
     async def _deanonymize_text(self, text: str) -> Dict[str, Any]:
 
@@ -266,6 +291,7 @@ class Filter:
         body,
         input_filter: str,
         event_emitter,
+        metadata: Optional[Dict[str, Any]] = None,
     ):
         content_to_anonymize = ""
         system_prompt = ""
@@ -335,7 +361,7 @@ class Filter:
             )
             logging.warning(f"Anymize.ai JobID: {response['job_id']}")
             result = await self._poll_status(response["job_id"])
-            await self._log_hash_pairs(response["job_id"])
+            await self._store_hash_pairs(response["job_id"], metadata)
 
             # Combine anonymized content with system prompt
             final_content = result["anonymized_text_raw"]
@@ -371,6 +397,7 @@ class Filter:
         self,
         body: Dict[str, Any],
         __event_emitter__,
+        __metadata__: Optional[Dict[str, Any]] = None,
         __user__: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if not self.toggle:
@@ -381,6 +408,7 @@ class Filter:
                 body,
                 input_filter=self.valves.input_filter,
                 event_emitter=__event_emitter__,
+                metadata=__metadata__,
             )
 
         except Exception as e:
@@ -399,7 +427,11 @@ class Filter:
             raise Exception(f"Anonymization failed: {str(e)}")
 
     async def outlet(
-        self, body: dict, __event_emitter__, __user__: Optional[dict] = None
+        self,
+        body: dict,
+        __event_emitter__,
+        __metadata__: Optional[Dict[str, Any]] = None,
+        __user__: Optional[dict] = None,
     ) -> dict:
         if not self.toggle:
             return body
