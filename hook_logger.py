@@ -1,8 +1,8 @@
 """
 title: hook_logger
 author: Mathias Gisch
-version: 0.3.0
-description: Loggt jeden Aufruf von inlet(), stream(), outlet() und jedes Tool-Ergebnis, ohne etwas zu verändern.
+version: 0.4.0
+description: Loggt jeden Aufruf von inlet(), stream(), outlet() und jedes Tool-Ergebnis, ohne etwas zu verändern. Optional (Valve outlet_overwrite, aus): ersetzt in outlet() die fertige Antwort komplett — Proof of Concept.
 """
 
 import functools
@@ -50,7 +50,7 @@ from typing import Any, Dict, Optional
 
 # Logged when the patches are installed. Open WebUI shows no version anywhere,
 # so this is the only way to tell from a log which source is actually running.
-_VERSION = "0.3.0"
+_VERSION = "0.4.0"
 
 # Marks a function this module has already wrapped, so that reloading the
 # filter in Open WebUI does not stack wrapper upon wrapper.
@@ -369,6 +369,24 @@ class Filter:
             ),
         )
 
+        outlet_overwrite: bool = Field(
+            default=False,
+            description=(
+                "Proof of concept: replace the whole assistant answer in outlet() "
+                "with outlet_overwrite_text — both content and the structured "
+                "output blocks the frontend actually renders. Off keeps this "
+                "filter a pure observer."
+            ),
+        )
+
+        outlet_overwrite_text: str = Field(
+            default=(
+                "[hook_logger] outlet overwrite PoC — die gestreamte Antwort wurde "
+                "ersetzt."
+            ),
+            description="Text that replaces the answer while outlet_overwrite is on.",
+        )
+
     def __init__(self):
         global _active_filter
 
@@ -461,6 +479,41 @@ class Filter:
 
         return event
 
+    def _overwrite_assistant_text(self, message: Dict[str, Any], text: str) -> str:
+        """Replace the text of one assistant message. Returns a note for the log.
+
+        Writing "content" alone is not enough from Open WebUI 0.10 on: the
+        frontend renders an assistant message from the structured "output"
+        blocks and falls back to "content" only when there are none
+        (ContentRenderer.svelte: `{#if output?.length}`). A message that was
+        streamed always carries those blocks, so the text assembled from the
+        stream chunks would stay on screen. The backend compares content and
+        output separately and persists both, so setting both is all it takes.
+        """
+
+        message["content"] = text
+
+        output = message.get("output")
+        if not isinstance(output, list):
+            return "content only (no output blocks)"
+
+        message_items = [
+            item
+            for item in output
+            if isinstance(item, dict) and item.get("type") == "message"
+        ]
+        if not message_items:
+            return f"content only ({len(output)} output blocks, none of type message)"
+
+        # Everything goes into the first message block; the rest are emptied.
+        # An emptied block is invisible, not broken: frontend and backend both
+        # skip message blocks whose text is blank.
+        message_items[0]["content"] = [{"type": "output_text", "text": text}]
+        for item in message_items[1:]:
+            item["content"] = []
+
+        return f"content + {len(message_items)} message block(s)"
+
     async def outlet(
         self,
         body: Dict[str, Any],
@@ -468,7 +521,7 @@ class Filter:
         __metadata__: Optional[Dict[str, Any]] = None,
         __user__: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Log the call and pass the body through untouched."""
+        """Log the call, and overwrite the answer when the PoC valve is on."""
 
         if self.valves.log_outlet:
             extra = ""
@@ -481,5 +534,25 @@ class Filter:
                 pass
 
             self._log("outlet", body, __metadata__, __user__, extra)
+
+        if self.valves.outlet_overwrite:
+            try:
+                for message in reversed(body.get("messages", [])):
+                    if message.get("role") != "assistant":
+                        continue
+
+                    before = message.get("content") or ""
+                    has_output = isinstance(message.get("output"), list)
+                    note = self._overwrite_assistant_text(
+                        message, self.valves.outlet_overwrite_text
+                    )
+                    logging.warning(
+                        f"hook_logger outlet_overwrite: id={message.get('id', '-')} "
+                        f"before_len={len(before)} output_blocks={has_output} -> {note}"
+                    )
+                    break
+            except Exception as e:
+                # A prototype must never destroy an answer.
+                logging.warning(f"hook_logger outlet_overwrite failed: {e}")
 
         return body
