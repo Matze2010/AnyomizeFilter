@@ -34,6 +34,14 @@ class Filter:
     METADATA_HASH_PAIRS_KEY = "_anymize_hash_pairs"
     METADATA_JOB_ID_KEY = "_anymize_job_id"
 
+    # Field of a hash pair that carries the full token as it appears in the
+    # anonymized text, e.g. "[[internal_id-S28MBV]]"
+    HASH_PAIR_REPLACEMENT_FIELD = "placeholder"
+
+    # Characters logged left and right of the first difference between the
+    # locally and the remotely anonymized text
+    DIFF_CONTEXT_CHARS = 20
+
     class Valves(BaseModel):
         anymize_api_key: str = Field(
             default="",
@@ -179,6 +187,52 @@ class Filter:
         )
 
         return hash_pairs
+
+    def _anonymize_locally(
+        self, text: str, hash_pairs: List[Dict[str, Any]]
+    ) -> str:
+
+        replacements = [
+            (pair["original"], pair[self.HASH_PAIR_REPLACEMENT_FIELD])
+            for pair in hash_pairs
+            if pair.get("original") and pair.get(self.HASH_PAIR_REPLACEMENT_FIELD)
+        ]
+
+        # Longest originals first: a shorter value that is a substring of a
+        # longer one ("Berlin" in "Berliner Str. 42, 10115 Berlin") would
+        # otherwise cut the longer one apart before it can be replaced.
+        replacements.sort(key=lambda pair: len(pair[0]), reverse=True)
+
+        for original, placeholder in replacements:
+            text = text.replace(original, placeholder)
+
+        return text
+
+    def _compare_local_anonymization(
+        self, local_text: str, api_text: str, job_id: str
+    ) -> bool:
+
+        if local_text == api_text:
+            return True
+
+        # Falls back to the end of the shorter text when one is a prefix of
+        # the other, where no pair of characters differs.
+        index = next(
+            (i for i, (a, b) in enumerate(zip(local_text, api_text)) if a != b),
+            min(len(local_text), len(api_text)),
+        )
+        start = max(0, index - self.DIFF_CONTEXT_CHARS)
+        end = index + self.DIFF_CONTEXT_CHARS
+
+        logging.warning(
+            f"Anymize.ai local anonymization for job {job_id} differs from the API result: "
+            f"local {len(local_text)} chars, API {len(api_text)} chars, "
+            f"first difference at index {index}\n"
+            f"  local: {local_text[start:end]!r}\n"
+            f"  api:   {api_text[start:end]!r}"
+        )
+
+        return False
 
     async def _deanonymize_text(self, text: str) -> Dict[str, Any]:
 
@@ -361,7 +415,24 @@ class Filter:
             )
             logging.warning(f"Anymize.ai JobID: {response['job_id']}")
             result = await self._poll_status(response["job_id"])
-            await self._store_hash_pairs(response["job_id"], metadata)
+            hash_pairs = await self._store_hash_pairs(response["job_id"], metadata)
+
+            # Cross-check: apply the hash pairs to the original text ourselves
+            # and compare with what the API returned. Purely diagnostic — the
+            # text sent to the LLM stays the API result either way, so a
+            # failure here must never break the request.
+            if hash_pairs:
+                try:
+                    self._compare_local_anonymization(
+                        self._anonymize_locally(content_to_anonymize, hash_pairs),
+                        result["anonymized_text_raw"],
+                        response["job_id"],
+                    )
+                except Exception as e:
+                    logging.warning(
+                        f"Anymize.ai local anonymization check for job "
+                        f"{response['job_id']} failed: {e}"
+                    )
 
             # Combine anonymized content with system prompt
             final_content = result["anonymized_text_raw"]
