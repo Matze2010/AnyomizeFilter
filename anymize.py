@@ -40,6 +40,14 @@ class Filter:
     HASH_PAIR_REPLACEMENT_FIELD = "placeholder"
 
     class Valves(BaseModel):
+        backend_url: str = Field(
+            default="https://app.anymize.ai",
+            description=(
+                "Base URL of the anymize backend, without trailing path. "
+                "Change only to reach a self-hosted or staging instance."
+            ),
+        )
+
         anymize_api_key: str = Field(
             default="",
             description="Your anymize API key (format: anymize_xxxxxxxxxxxxx)",
@@ -114,6 +122,18 @@ class Filter:
         pass
 
     @property
+    def base_url(self) -> str:
+        """Backend base URL from the valve, trailing slashes removed.
+
+        Resource paths are joined as f"{base_url}{resource}" and already
+        start with "/", so a trailing slash in the valve would produce
+        "//api/...". A valve emptied in the UI falls back to the default
+        rather than sending the requests to a relative path.
+        """
+
+        return self.valves.backend_url.strip().rstrip("/") or "https://app.anymize.ai"
+
+    @property
     def local_processing(self) -> bool:
         """True when at least one of the category valves is set.
 
@@ -141,7 +161,7 @@ class Filter:
             "Content-Type": "application/json",
         }
 
-        url = f"https://app.anymize.ai{resource}"
+        url = f"{self.base_url}{resource}"
 
         async with aiohttp.ClientSession() as session:
             if method == "POST":
@@ -298,7 +318,7 @@ class Filter:
                 data.add_field("language", self.valves.language)
 
                 async with session.post(
-                    "https://app.anymize.ai/api/ocr", headers=headers, data=data
+                    f"{self.base_url}/api/ocr", headers=headers, data=data
                 ) as response:
                     return await response.json()
 
