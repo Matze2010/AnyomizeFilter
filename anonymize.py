@@ -2,11 +2,12 @@
 title: anonymize.py
 description: "Filter for anonymizing and deanonymizing text and files using an external API. The filter can be toggled on/off and configured via valves."
 author: Mathias Gisch
-version: 1.2.0
+version: 1.3.0
 """
 
 import asyncio
 import aiohttp
+import fnmatch
 import functools
 import inspect
 import os
@@ -48,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 # Logged when the patch is installed. Open WebUI shows no version anywhere, so
 # this is the only way to tell from a log which source is actually running.
-_VERSION = "1.2.0"
+_VERSION = "1.3.0"
 
 # Marks a function this module has already wrapped, so that reloading the
 # filter in Open WebUI does not stack wrapper upon wrapper.
@@ -182,6 +183,40 @@ async def _event_emitter_for(metadata: Optional[Dict[str, Any]]):
     except Exception as e:
         logging.warning(f"Anymize could not build an event emitter: {e}")
         return None
+
+
+def _parse_tool_patterns(raw: Optional[str]) -> List[str]:
+    """Split a comma-separated valve into normalized match patterns."""
+
+    if not raw:
+        return []
+
+    return [part.strip().lower() for part in raw.split(",") if part.strip()]
+
+
+def _tool_excluded(tool_name: str, raw: Optional[str]) -> bool:
+    """True when tool_name matches an entry of the exclusion valve.
+
+    Case-insensitive; entries may use shell wildcards (`*`, `?`, `[...]`) so
+    that a whole MCP server can be excluded with one line, e.g. `enaio_*`.
+    fnmatchcase() rather than fnmatch(), because the latter additionally
+    normalizes by platform rules — both sides are lowercased here already.
+
+    Never raises: a broken pattern must not withhold a tool result.
+    """
+
+    name = (tool_name or "").strip().lower()
+    if not name:
+        return False
+
+    try:
+        return any(
+            fnmatch.fnmatchcase(name, pattern)
+            for pattern in _parse_tool_patterns(raw)
+        )
+    except Exception as e:
+        logging.warning(f"Anymize tool_filter_exclude could not be evaluated: {e}")
+        return False
 
 
 async def _anonymize_tool_result(tool_result, arguments: Dict[str, Any]):
@@ -334,6 +369,18 @@ class Filter:
                 "that is installed when this filter loads; tool results never "
                 "reach inlet/stream/outlet. If the anonymization fails, the "
                 "result is withheld from the model."
+            ),
+        )
+
+        tool_filter_exclude: str = Field(
+            default="",
+            description=(
+                "Comma-separated tool names whose result is NOT anonymized and "
+                "is handed to the model unchanged. Matched against "
+                "tool_function_name, case-insensitive, with shell wildcards: "
+                "'get_time, enaio_*'. Only effective while tool_filter is on. "
+                "WARNING: the result of an excluded tool reaches the model in "
+                "clear text. Empty means every tool result is anonymized."
             ),
         )
 
@@ -811,6 +858,22 @@ class Filter:
             return tool_result
 
         if not isinstance(tool_result, str) or not tool_result.strip():
+            return tool_result
+
+        # Checked before the emitter is built: an excluded tool produces no
+        # status in the chat at all, exactly as if tool_filter were off.
+        if _tool_excluded(__tool_name__, self.valves.tool_filter_exclude):
+            if self.valves.log_tool_payload:
+                logging.warning(
+                    f"Anonymize tool_result skipped: name={__tool_name__} "
+                    f"{tool_result!r}"
+                )
+            else:
+                logging.warning(
+                    f"Anonymize tool_result skipped: name={__tool_name__} "
+                    f"len={len(tool_result)} — excluded by tool_filter_exclude, "
+                    f"handed to the model unchanged"
+                )
             return tool_result
 
         # Built from __metadata__ rather than passed in — see _event_emitter_for().
