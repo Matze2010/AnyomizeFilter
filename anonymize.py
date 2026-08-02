@@ -213,7 +213,7 @@ class Filter:
         try:
             response = await self._get_hash_pairs(job_id)
         except Exception as e:
-            logging.warning(f"Anymize.ai hash pairs for job {job_id} unavailable: {e}")
+            logging.warning(f"Anonymize hash pairs for job {job_id} unavailable: {e}")
             return []
 
         hash_pairs = [
@@ -226,7 +226,7 @@ class Filter:
             metadata[self.METADATA_JOB_ID_KEY] = job_id
 
         if not hash_pairs:
-            logging.warning(f"Anymize.ai hash pairs for job {job_id}: none returned")
+            logging.warning(f"Anonymize hash pairs for job {job_id}: none returned")
             return hash_pairs
 
         pairs = "\n".join(
@@ -235,7 +235,7 @@ class Filter:
             for pair in hash_pairs
         )
         logging.warning(
-            f"Anymize.ai hash pairs for job {job_id} "
+            f"Anonymize hash pairs for job {job_id} "
             f"({response.get('total', len(hash_pairs))} entries):\n{pairs}"
         )
 
@@ -267,7 +267,7 @@ class Filter:
         skipped = len(hash_pairs) - len(filtered)
         if skipped:
             logging.warning(
-                f"Anymize.ai local anonymization: {skipped} of {len(hash_pairs)} hash pairs "
+                f"Anonymize local anonymization: {skipped} of {len(hash_pairs)} hash pairs "
                 f"skipped by category valves (allowed={sorted(allowed)}, "
                 f"disallowed={sorted(disallowed)}) — values of a skipped category stay "
                 f"in clear text"
@@ -476,7 +476,7 @@ class Filter:
             response = await self._anonymize_text(
                 content_to_anonymize, self.valves.language
             )
-            logging.warning(f"Anymize.ai JobID: {response['job_id']}")
+            logging.warning(f"Anonymize JobID: {response['job_id']}")
             result = await self._poll_status(response["job_id"])
             hash_pairs = await self._store_hash_pairs(response["job_id"], metadata)
 
@@ -487,31 +487,31 @@ class Filter:
                     content_to_anonymize, hash_pairs
                 )
                 logging.warning(
-                    f"Anymize.ai job {response['job_id']}: anonymized locally from "
+                    f"Aonymize job {response['job_id']}: anonymized locally from "
                     f"{len(hash_pairs)} hash pairs (before category filtering)"
                 )
                 if final_content == content_to_anonymize:
                     logging.warning(
-                        f"Anymize.ai local anonymization for job {response['job_id']} "
+                        f"Anonymize local anonymization for job {response['job_id']} "
                         f"replaced nothing — the message goes to the model unmasked"
                     )
             else:
                 # Either no category valve is set, or there are no hash pairs to
                 # work with. The latter is what Zero Data Retention looks like
                 # from here: ZDR is an account setting, not a request parameter,
-                # and with it enabled anymize.ai keeps no placeholder-to-original
+                # and with it enabled the backend keeps no placeholder-to-original
                 # mapping, so GET /api/status/{job_id}/strings returns nothing.
                 # The local path would then replace nothing and send the original
                 # message in clear text, so fall back to the text the API masked.
                 if self.local_processing:
                     logging.warning(
-                        f"Anymize.ai job {response['job_id']}: no hash pairs available "
+                        f"Anonymize job {response['job_id']}: no hash pairs available "
                         f"(Zero Data Retention enabled?) — using the anonymized text "
                         f"from the API instead of local anonymization"
                     )
                 else:
                     logging.warning(
-                        f"Anymize.ai job {response['job_id']}: using the anonymized "
+                        f"Anonymize job {response['job_id']}: using the anonymized "
                         f"text from the API"
                     )
                 final_content = result["anonymized_text_raw"]
@@ -605,12 +605,12 @@ class Filter:
                 chunk = __metadata__.get(self.METADATA_STREAM_CHUNKS_KEY, 0) + 1
                 __metadata__[self.METADATA_STREAM_CHUNKS_KEY] = chunk
 
-            logging.warning(f"Anymize.ai stream chunk {chunk}: {event!r}")
+            logging.warning(f"Anonymize stream chunk {chunk}: {event!r}")
 
         except Exception as e:
             # Never raise from here — an exception would tear down the response
             # mid-stream, and this hook only observes.
-            logging.warning(f"Anymize.ai stream logging failed: {e}")
+            logging.warning(f"Anonymize stream logging failed: {e}")
 
         return event
 
