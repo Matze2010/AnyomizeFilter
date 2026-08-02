@@ -65,7 +65,7 @@ sequenceDiagram
 3. **Text**: der Text der letzten User-Message wird an den OCR-Text angehängt.
 4. **Anonymisierung** (Modi `text_anonymization`, `text_file_anonymization`): der kombinierte Inhalt geht mit der konfigurierten Sprache an `POST /api/anonymize`, die zurückgegebene `job_id` wird über `GET /api/status/{job_id}` gepollt. Der von der API gelieferte `systemprompt` (Regeln zum korrekten Umgang mit Platzhaltern) wird an den Inhalt angehängt. Ist die Valve `store_hash_pairs` gesetzt, holt `_store_hash_pairs()` anschließend über `GET /api/status/{job_id}/strings` die vollständige Zuordnungstabelle und legt sie in `__metadata__` ab; im Default unterbleibt der Abruf (siehe [Datenschutz-Hinweis](#datenschutz-hinweis)).
 5. **Ersetzen**: `final_content` ist immer der `anonymized_text_raw` der API, ergänzt um den `systemprompt`. Damit wird die letzte User-Message im `body` überschrieben. Open WebUI schickt sie so ans Modell — das LLM sieht nur Platzhalter.
-6. **`tool()`** wird für jedes Tool-Ergebnis gerufen — nicht von Open WebUI, sondern aus dem Monkey Patch von `middleware.process_tool_result()`, den der Filter beim Laden installiert. Das bereits zu Text normalisierte Ergebnis läuft durch dieselbe Anonymisierung wie die User-Message und geht maskiert als `role="tool"`-Message ans Modell. Siehe [Tool-Ergebnisse](#tool-ergebnisse).
+6. **`tool()`** wird für jedes Tool-Ergebnis gerufen — nicht von Open WebUI, sondern aus dem Monkey Patch von `middleware.process_tool_result()`, den der Filter beim Laden installiert. Das bereits zu Text normalisierte Ergebnis läuft durch dieselbe Anonymisierung wie die User-Message und geht maskiert als `role="tool"`-Message ans Modell. Steht der Tool-Name in der Valve `tool_filter_exclude`, wird das Ergebnis unverändert durchgereicht. Siehe [Tool-Ergebnisse](#tool-ergebnisse).
 7. **`stream()`** wird bei aktivem Streaming für jeden Chunk der Antwort gerufen und gibt das `event` unverändert zurück — der Hook tut nichts.
 8. **`outlet()`** wird nach der LLM-Antwort gerufen. Zuerst schreibt `_log_hash_pairs()` die in `__metadata__` gesammelte Zuordnungstabelle einmal ins Serverlog — nur, wenn `store_hash_pairs` gesetzt ist und damit überhaupt etwas gesammelt wurde. Danach: bei `output_filter = "deanonymized"` geht die Assistant-Nachricht an `POST /api/deanonymize`; das Ergebnis ersetzt die Antwort im Chat. Bei `"anonymized"` bleibt sie unverändert, die Platzhalter bleiben sichtbar.
 9. **Statusmeldungen** („Processing files…", „Anonymizing content…", „Anonymizing result of &lt;tool&gt;…", „De-anonymizing content…") laufen über `__event_emitter__` und erscheinen im Chat-Verlauf.
@@ -93,6 +93,7 @@ sequenceDiagram
 | `input_filter` | `text_anonymization` | Was vor dem LLM verarbeitet wird — siehe Modi unten. |
 | `output_filter` | `deanonymized` | Was mit der LLM-Antwort passiert — siehe unten. |
 | `tool_filter` | `true` | Maskiert das Ergebnis jedes Tool-Calls, bevor es das Modell sieht — siehe [Tool-Ergebnisse](#tool-ergebnisse). Braucht den Monkey Patch von `middleware.process_tool_result`, der beim Laden des Filters installiert wird. |
+| `tool_filter_exclude` | `""` | Kommagetrennte Liste von Tool-Namen, deren Ergebnis **nicht** maskiert und unverändert an das LLM durchgereicht wird, z.B. `get_time, enaio_*`. Groß-/Kleinschreibung egal, Wildcards erlaubt — siehe [Ausgeschlossene Tools](#ausgeschlossene-tools). Wirkt nur, solange `tool_filter` an ist. ⚠️ Das Ergebnis eines ausgeschlossenen Tools erreicht das Modell im Klartext. Leer = jedes Tool-Ergebnis wird maskiert. |
 | `store_hash_pairs` | `false` | Ruft nach jeder erfolgreichen Anonymisierung die Zuordnungstabelle über `GET /api/status/{job_id}/strings` ab und sammelt sie in `__metadata__`; `outlet()` schreibt sie am Ende des Requests einmal ins Serverlog. ⚠️ Damit stehen die Originalwerte im Klartext im Log. Aus = die Tabelle wird gar nicht erst abgerufen. |
 | `log_tool_payload` | `false` | Schreibt die Parameter jedes `process_tool_result()`-Aufrufs sowie jedes Tool-Ergebnis vor und nach der Maskierung vollständig ins Serverlog. ⚠️ Das rohe Ergebnis steht damit im Klartext im Log. Aus = kompakte Zeilen mit Typ, Länge und Korrelations-IDs. |
 | `priority` | `10` | Ausführungsreihenfolge unter mehreren Filtern; kleinere Werte laufen zuerst. |
@@ -143,7 +144,7 @@ Alles in `class Filter` in [`anonymize.py`](anonymize.py):
 | Datei-Handling | `get_file_paths()`, `process_multiple_files_for_ocr()` — Upload und Polling parallel via `asyncio.gather()` |
 | Orchestrierung | `_anonymize_content()` — ein Text von der Abgabe bis zum maskierten Ergebnis (Job, Polling, Zuordnungstabelle); genutzt von `process_input()` und `tool()`. `process_input()` — sammelt Inhalte, ruft die Anonymisierung, überschreibt die letzte User-Message |
 | Open-WebUI-Hooks | `inlet()` (vor dem LLM), `stream()` (je Chunk, reiner Durchreicher), `outlet()` (nach dem LLM) — alle mit `__metadata__` |
-| Tool-Ergebnisse | Modul-Ebene: `_unwrap()`, `_bind_tool_call()`, `_anonymize_tool_result()`, `_install_process_tool_result_patch()` — Monkey Patch. In der Klasse: `tool()` — siehe [Tool-Ergebnisse](#tool-ergebnisse) |
+| Tool-Ergebnisse | Modul-Ebene: `_unwrap()`, `_bind_tool_call()`, `_anonymize_tool_result()`, `_install_process_tool_result_patch()` — Monkey Patch; `_parse_tool_patterns()`, `_tool_excluded()` — Auswertung der Valve `tool_filter_exclude`. In der Klasse: `tool()` — siehe [Tool-Ergebnisse](#tool-ergebnisse) |
 
 ### Hash-Paare in `__metadata__`
 
@@ -208,6 +209,25 @@ Die Funktion ist in `middleware` modulglobal definiert und wird über den Modul-
 
 Die Platzhalter aus Tool-Ergebnissen löst `outlet()` mit auf: `POST /api/deanonymize` arbeitet unabhängig vom Job.
 
+#### Ausgeschlossene Tools
+
+Nicht jedes Tool liefert PII. Ein Tool, das Aktenzeichen, IDs, Statuswerte, Zeitreihen oder Code zurückgibt, verliert durch die Maskierung Information, kostet einen eigenen Anonymisierungs-Job samt Polling und schickt seinen Text an die externe API. Die Valve `tool_filter_exclude` nimmt solche Tools heraus:
+
+```
+tool_filter_exclude = get_time, enaio_*, list_users
+```
+
+Verglichen wird gegen `tool_function_name`, also den Namen, unter dem das Tool bei Open WebUI registriert ist (dieselbe Zeichenkette, die im Aufruf-Log als `tool_function_name='…'` steht — siehe unten).
+
+- **Exakter Vergleich**, kein Substring: `get_time` trifft `get_time`, aber nicht `get_time_zone`.
+- **Groß-/Kleinschreibung egal**, führende und abschließende Leerzeichen werden abgeschnitten, leere Einträge ignoriert.
+- **Shell-Wildcards** (`*`, `?`, `[…]`) über `fnmatch`: `enaio_*` schließt alle Tools eines MCP-Servers mit diesem Präfix aus, `*` schaltet die Tool-Anonymisierung faktisch ab.
+- Ein **unbrauchbares Muster** führt zu keinem Treffer und einer Log-Warnung; das Ergebnis wird dann normal maskiert, nicht versehentlich durchgereicht.
+
+Ein Treffer überspringt den kompletten Pfad: kein Job, kein Aufruf der externen API, keine Statusanzeige im Chat. Das Ergebnis geht byte-identisch an das Modell, protokolliert wird nur eine Zeile im Serverlog. Das Aufruf-Logging von `process_tool_result()` bleibt davon unberührt — der Call selbst erscheint weiterhin im Log.
+
+Unterschied zu `tool_filter = false`: Letzteres reicht **jedes** Tool-Ergebnis unverändert durch; `tool_filter_exclude` wirkt nur auf die genannten Namen und wird gar nicht erst ausgewertet, wenn `tool_filter` aus ist.
+
 Die Patch-Mechanik entspricht der von [`hook_logger.py`](hook_logger.py): `_PATCH_FLAG`/`_PATCH_ORIGINAL` markieren den eigenen Wrapper, `_unwrap()` schält ihn vor der Neuinstallation ab. Nötig ist das, weil Open WebUI das Function-Modul bei jeder Valve-Änderung neu ausführt — ohne Abschälen stapeln sich Wrapper, die die Valves einer alten Instanz lesen und je Tool-Call mehrere Anonymisierungs-Jobs auslösen würden. Fehlt `process_tool_result` (ältere Open-WebUI-Version), läuft der Filter ohne Tool-Anonymisierung weiter und schreibt eine Warnung ins Log.
 
 **Statusanzeige**: `process_tool_result()` bekommt keinen Event-Emitter — der liegt im Aufrufer `tool_call_handler` als Closure-Variable. `tool()` baut sich deshalb über `get_event_emitter(__metadata__)` aus `open_webui.socket.main` einen eigenen, genau wie Open WebUI es für die Filter-Hooks tut; die Funktion liest `user_id`, `chat_id` und `message_id` aus dem Dict. Fehlt einer der Keys oder das Modul, entfällt die Anzeige stillschweigend, die Anonymisierung läuft weiter.
@@ -235,6 +255,7 @@ Erwartete Logzeilen:
 | Funktion fehlt | `Anymize: middleware.process_tool_result not found — tool results are NOT anonymized on this Open WebUI version` |
 | Aufruf | `Anymize process_tool_result: <alle Parameter>` |
 | Tool-Ergebnis maskiert | `Anonymize tool_result: name=<tool> len=<vorher> -> <nachher>` |
+| Tool-Ergebnis übersprungen | `Anonymize tool_result skipped: name=<tool> len=<n> — excluded by tool_filter_exclude, handed to the model unchanged` |
 | Fehlschlag | `Anonymize tool_result failed: name=<tool> … — result withheld from the model` |
 
 ---
@@ -250,7 +271,9 @@ Erwartete Logzeilen:
 
 ## Bekannte Einschränkungen
 
-Stand der aktuellen Fassung von `anonymize.py` (Version 1.2.0):
+Stand der aktuellen Fassung von `anonymize.py` (Version 1.3.0):
+
+- **Jeder Eintrag in `tool_filter_exclude` ist ein bewusster Klartext-Pfad zum LLM**: Das Ergebnis eines ausgeschlossenen Tools wird nicht geprüft, sondern ungesehen durchgereicht — liefert das Tool später doch PII (geänderte Query, erweiterte API, anderer Datenbestand), fällt das nicht auf. Ein zu weit gefasstes Wildcard (`*` oder ein Präfix, das mehr Tools trifft als gedacht) schaltet die Tool-Anonymisierung faktisch ab, ohne dass `tool_filter` auf `false` steht.
 
 - **Der Patch von `process_tool_result()` greift in Open-WebUI-Interna ein** und kann bei jedem Upgrade brechen. Ändert sich die Signatur, wird sie über `inspect.signature()` weiterhin korrekt gebunden; verschwindet die Funktion, entfällt die Tool-Anonymisierung stillschweigend bis auf eine Log-Warnung.
 - **`tool_result_files` und `tool_result_embeds` bleiben unmaskiert**: Inline-HTML-Embeds und Bilder eines Tools reicht der Wrapper unverändert durch. Sie gehen an das Frontend, nicht an das LLM — im Chat sichtbare PII ist damit weiterhin möglich.
@@ -271,6 +294,8 @@ Der Filter schickt Chat-Inhalte und hochgeladene Dateien an externe APIs — die
 **Die Zuordnungstabelle landet nur auf Anforderung im Log**: Mit `store_hash_pairs = true` ruft `_store_hash_pairs()` nach jeder Anonymisierung die Hash-Paare ab, sammelt sie in `__metadata__`, und `_log_hash_pairs()` schreibt sie am Ende des Requests aus `outlet()` per `logging.warning` ins Open-WebUI-Serverlog — inklusive der Originalwerte im Klartext (`original='Max Mustermann'`). Die PII steht damit unmaskiert an einer Stelle, die der Filter sonst gerade schützt; wer Logs weiterleitet, aggregiert oder langfristig aufbewahrt, sollte das einkalkulieren. Im Default ist die Valve aus, und die Tabelle wird gar nicht erst abgerufen.
 
 **Tool-Ergebnisse laufen ebenfalls durch die externe API** — und mit `log_tool_payload = true` zusätzlich im Klartext ins Serverlog, vor und nach der Maskierung. Die Valve ist eine Debug-Hilfe und gehört im Regelbetrieb aus.
+
+**Über `tool_filter_exclude` ausgeschlossene Tools sehen die externe API gar nicht erst**: Ihr Ergebnis verlässt die eigene Infrastruktur nicht und wird auch nicht im Klartext geloggt. Derselbe Umstand ist das Risiko — es erreicht das LLM unmaskiert. Die Valve gehört deshalb auf Tools beschränkt, deren Ausgabe nachweislich keine personenbezogenen Daten enthalten kann.
 
 Die zweite Kopie in `__metadata__` ist dagegen auf den einzelnen Request begrenzt und wird mit ihm verworfen — kein geteilter Zustand zwischen Nutzern oder Chats.
 
