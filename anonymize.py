@@ -2,7 +2,7 @@
 title: anonymize.py
 description: "Filter for anonymizing and deanonymizing text and files using an external API. The filter can be toggled on/off and configured via valves."
 author: Mathias Gisch
-version: 1.1.0
+version: 1.2.0
 """
 
 import asyncio
@@ -12,7 +12,7 @@ import inspect
 import os
 import logging
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, List, Set, Any
+from typing import Optional, Dict, List, Any
 
 from open_webui.utils.misc import get_last_user_message, get_last_assistant_message
 from open_webui.config import UPLOAD_DIR
@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 
 # Logged when the patch is installed. Open WebUI shows no version anywhere, so
 # this is the only way to tell from a log which source is actually running.
-_VERSION = "1.1.0"
+_VERSION = "1.2.0"
 
 # Marks a function this module has already wrapped, so that reloading the
 # filter in Open WebUI does not stack wrapper upon wrapper.
@@ -276,10 +276,6 @@ class Filter:
     # input anonymization done in inlet().
     METADATA_TOOL_JOB_IDS_KEY = "_anymize_tool_job_ids"
 
-    # Field of a hash pair that carries the full token as it appears in the
-    # anonymized text, e.g. "[[internal_id-S28MBV]]"
-    HASH_PAIR_REPLACEMENT_FIELD = "placeholder"
-
     class Valves(BaseModel):
         backend_url: str = Field(
             default="https://app.anymize.ai",
@@ -341,24 +337,14 @@ class Filter:
             ),
         )
 
-        allowed_categories: str = Field(
-            default="",
+        store_hash_pairs: bool = Field(
+            default=False,
             description=(
-                "Comma-separated PII categories (hash pair prefix_name) to mask. "
-                "WARNING: setting this switches anonymization to the local path — "
-                "the message is masked from the hash pair table instead of using the "
-                "text returned by the API, and anything outside these categories "
-                "reaches the model in clear text. Empty means all categories."
-            ),
-        )
-
-        disallowed_categories: str = Field(
-            default="",
-            description=(
-                "Comma-separated PII categories to leave unmasked; wins over "
-                "allowed_categories. WARNING: setting this switches anonymization to "
-                "the local path — values of these categories reach the model in clear "
-                "text. Empty means none are excluded."
+                "After every successful anonymization, fetch the placeholder-to-"
+                "original mapping from GET /api/status/{job_id}/strings and keep it "
+                "in __metadata__ for the rest of the request; outlet() then logs the "
+                "collected table once. WARNING: writes the original values in clear "
+                "text into the server log. Off means the mapping is never fetched."
             ),
         )
 
@@ -400,21 +386,6 @@ class Filter:
         """
 
         return self.valves.backend_url.strip().rstrip("/") or "https://app.anymize.ai"
-
-    @property
-    def local_processing(self) -> bool:
-        """True when at least one of the category valves is set.
-
-        Read on access rather than stored in __init__: Open WebUI assigns
-        self.valves after construction and again whenever the valves are
-        edited, so a value computed in __init__ would only ever see the
-        defaults.
-        """
-
-        return bool(
-            self._parse_categories(self.valves.allowed_categories)
-            or self._parse_categories(self.valves.disallowed_categories)
-        )
 
     async def _anymize_api_request(
         self,
@@ -481,6 +452,9 @@ class Filter:
         is_tool_result: bool = False,
     ) -> List[Dict[str, Any]]:
 
+        if not self.valves.store_hash_pairs:
+            return []
+
         try:
             response = await self._get_hash_pairs(job_id)
         except Exception as e:
@@ -509,7 +483,26 @@ class Filter:
 
         if not hash_pairs:
             logging.warning(f"Anonymize hash pairs for job {job_id}: none returned")
-            return hash_pairs
+
+        return hash_pairs
+
+    def _log_hash_pairs(self, metadata: Optional[Dict[str, Any]]) -> None:
+        """Log the mapping collected during this request, once, at the end.
+
+        The pairs of every job of the request are written in one place instead
+        of one block per anonymization. Nothing was collected when the valve
+        store_hash_pairs is off, and then nothing is logged either.
+        """
+
+        if metadata is None:
+            return
+
+        hash_pairs = metadata.get(self.METADATA_HASH_PAIRS_KEY) or []
+        if not hash_pairs:
+            return
+
+        job_id = metadata.get(self.METADATA_JOB_ID_KEY)
+        tool_job_ids = metadata.get(self.METADATA_TOOL_JOB_IDS_KEY) or []
 
         pairs = "\n".join(
             "  "
@@ -517,67 +510,10 @@ class Filter:
             for pair in hash_pairs
         )
         logging.warning(
-            f"Anonymize hash pairs for job {job_id} "
-            f"({response.get('total', len(hash_pairs))} entries):\n{pairs}"
+            f"Anonymize hash pairs of this request "
+            f"(input job {job_id}, tool jobs {tool_job_ids}, "
+            f"{len(hash_pairs)} entries):\n{pairs}"
         )
-
-        return hash_pairs
-
-    def _parse_categories(self, value: str) -> Set[str]:
-
-        return {part.strip().lower() for part in value.split(",") if part.strip()}
-
-    def _filter_hash_pairs(
-        self, hash_pairs: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-
-        allowed = self._parse_categories(self.valves.allowed_categories)
-        disallowed = self._parse_categories(self.valves.disallowed_categories)
-
-        if not allowed and not disallowed:
-            return hash_pairs
-
-        filtered = []
-        for pair in hash_pairs:
-            category = (pair.get("prefix_name") or "").strip().lower()
-            if category in disallowed:  # disallowed wins over allowed
-                continue
-            if allowed and category not in allowed:
-                continue
-            filtered.append(pair)
-
-        skipped = len(hash_pairs) - len(filtered)
-        if skipped:
-            logging.warning(
-                f"Anonymize local anonymization: {skipped} of {len(hash_pairs)} hash pairs "
-                f"skipped by category valves (allowed={sorted(allowed)}, "
-                f"disallowed={sorted(disallowed)}) — values of a skipped category stay "
-                f"in clear text"
-            )
-
-        return filtered
-
-    def _anonymize_locally(
-        self, text: str, hash_pairs: List[Dict[str, Any]]
-    ) -> str:
-
-        hash_pairs = self._filter_hash_pairs(hash_pairs)
-
-        replacements = [
-            (pair["original"], pair[self.HASH_PAIR_REPLACEMENT_FIELD])
-            for pair in hash_pairs
-            if pair.get("original") and pair.get(self.HASH_PAIR_REPLACEMENT_FIELD)
-        ]
-
-        # Longest originals first: a shorter value that is a substring of a
-        # longer one ("Berlin" in "Berliner Str. 42, 10115 Berlin") would
-        # otherwise cut the longer one apart before it can be replaced.
-        replacements.sort(key=lambda pair: len(pair[0]), reverse=True)
-
-        for original, placeholder in replacements:
-            text = text.replace(original, placeholder)
-
-        return text
 
     async def _deanonymize_text(self, text: str) -> Dict[str, Any]:
 
@@ -696,8 +632,7 @@ class Filter:
 
         Returns the masked text and the completed status response, so the
         caller can still reach fields like "systemprompt". Shared by
-        process_input() and tool() so both take the same path through the
-        category valves.
+        process_input() and tool() so both take the same path.
         """
 
         response = await self._anonymize_text(text, self.valves.language)
@@ -705,41 +640,16 @@ class Filter:
         logging.warning(f"Anonymize JobID: {job_id}{context}")
 
         result = await self._poll_status(job_id)
-        hash_pairs = await self._store_hash_pairs(job_id, metadata, is_tool_result)
 
-        if self.local_processing and hash_pairs:
-            # Category valves are set: mask locally from the hash pairs
-            # instead of using the text the API returned.
-            final_content = self._anonymize_locally(text, hash_pairs)
-            logging.warning(
-                f"Aonymize job {job_id}: anonymized locally from "
-                f"{len(hash_pairs)} hash pairs (before category filtering)"
-            )
-            if final_content == text:
-                logging.warning(
-                    f"Anonymize local anonymization for job {job_id} "
-                    f"replaced nothing — the message goes to the model unmasked"
-                )
-        else:
-            # Either no category valve is set, or there are no hash pairs to
-            # work with. The latter is what Zero Data Retention looks like
-            # from here: ZDR is an account setting, not a request parameter,
-            # and with it enabled the backend keeps no placeholder-to-original
-            # mapping, so GET /api/status/{job_id}/strings returns nothing.
-            # The local path would then replace nothing and send the original
-            # message in clear text, so fall back to the text the API masked.
-            if self.local_processing:
-                logging.warning(
-                    f"Anonymize job {job_id}: no hash pairs available "
-                    f"(Zero Data Retention enabled?) — using the anonymized text "
-                    f"from the API instead of local anonymization"
-                )
-            else:
-                logging.warning(
-                    f"Anonymize job {job_id}: using the anonymized "
-                    f"text from the API"
-                )
-            final_content = result["anonymized_text_raw"]
+        # Collects the mapping in __metadata__ for outlet() to log, and only
+        # when the valve store_hash_pairs is set. The masked text itself always
+        # comes from the API and does not depend on it.
+        await self._store_hash_pairs(job_id, metadata, is_tool_result)
+
+        logging.warning(
+            f"Anonymize job {job_id}: using the anonymized text from the API"
+        )
+        final_content = result["anonymized_text_raw"]
 
         return final_content, result
 
@@ -999,6 +909,14 @@ class Filter:
     ) -> dict:
         if not self.toggle:
             return body
+
+        # Own try/except and placed before the de-anonymization: the table is
+        # logged even when POST /api/deanonymize fails, and a broken log line
+        # never costs the response.
+        try:
+            self._log_hash_pairs(__metadata__)
+        except Exception as e:
+            logging.warning(f"Anonymize hash pair logging failed: {e}")
 
         try:
             assistant_message = get_last_assistant_message(body["messages"])
