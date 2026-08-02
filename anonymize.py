@@ -1,12 +1,14 @@
 """
 title: anonymize.py
 description: "Filter for anonymizing and deanonymizing text and files using an external API. The filter can be toggled on/off and configured via valves."
-author: MatIas
-version: 1.0.0
+author: Mathias Gisch
+version: 1.1.0
 """
 
 import asyncio
 import aiohttp
+import functools
+import inspect
 import os
 import logging
 from pydantic import BaseModel, Field
@@ -17,6 +19,244 @@ from open_webui.config import UPLOAD_DIR
 
 logger = logging.getLogger(__name__)
 
+# --------------------------------------------------------------------------
+# Tool result interception
+#
+# Filters only wrap the chat boundary. The result of a tool call never passes
+# inlet(), stream() or outlet(): Open WebUI runs the tool inside
+# utils/middleware.py, normalizes the result in process_tool_result(), appends
+# a role="tool" message and calls the model again without re-entering the
+# filter chain. A tool that reads a case file, a database or a mailbox would
+# therefore hand PII to the model in clear text even with this filter active.
+#
+# process_tool_result(request, tool_function_name, tool_result, tool_type,
+#                     direct_tool=False, metadata=None, user=None)
+#     -> (tool_result, tool_result_files, tool_result_embeds)
+#
+# It is defined at module level in middleware and called through the module
+# global, so replacing middleware.process_tool_result covers every call site
+# (native and prompt-based function calling, MCP, direct tools).
+#
+# The wrapper runs AFTER the original: by then dict, list, tuple, HTMLResponse
+# and MCP items are already normalized to a string, so Filter.tool() only ever
+# sees text.
+#
+# PROTOTYPE. This is a monkey patch of Open WebUI internals and can break on
+# any upgrade. If process_tool_result is missing, the filter keeps working
+# without tool anonymization and says so in the log.
+# --------------------------------------------------------------------------
+
+# Logged when the patch is installed. Open WebUI shows no version anywhere, so
+# this is the only way to tell from a log which source is actually running.
+_VERSION = "1.1.0"
+
+# Marks a function this module has already wrapped, so that reloading the
+# filter in Open WebUI does not stack wrapper upon wrapper.
+_PATCH_FLAG = "_anymize_tool_wrapped"
+
+# Where a wrapper keeps the function it replaced. Open WebUI re-execs the whole
+# function module whenever its valves are edited or the source is updated, and
+# everything the previous module object installed stays in place — wrappers
+# that read the valves of the previous instance. Nothing is therefore ever
+# skipped because it is "already wrapped": the wrapper is peeled off along this
+# attribute first and rebuilt by the module loaded last.
+_PATCH_ORIGINAL = "_anymize_tool_original"
+
+# The Filter instance whose valves the wrapper reads. Open WebUI keeps one
+# instance per function, and the wrapper lives outside the class, so the
+# instance registers itself here in __init__.
+_active_filter = None
+
+
+def _unwrap(fn):
+    """Strip wrappers of this module, including those of an older version."""
+
+    seen = set()
+    while callable(fn) and getattr(fn, _PATCH_FLAG, False):
+        if id(fn) in seen:
+            break
+        seen.add(id(fn))
+        inner = getattr(fn, _PATCH_ORIGINAL, None) or getattr(fn, "__wrapped__", None)
+        if inner is None:
+            break
+        fn = inner
+
+    return fn
+
+
+def _bind_tool_call(original, args, kwargs) -> Dict[str, Any]:
+    """Resolve the arguments of a process_tool_result() call by name.
+
+    Middleware calls positionally, but binding against the signature of the
+    original keeps this working if Open WebUI reorders or adds parameters.
+    """
+
+    try:
+        bound = inspect.signature(original).bind(*args, **kwargs)
+        bound.apply_defaults()
+        return dict(bound.arguments)
+    except Exception as e:
+        logging.warning(f"Anymize could not read the tool call arguments: {e}")
+        return {}
+
+
+def _describe_argument(name: str, value: Any) -> str:
+    """One `name=value` pair for the call log, compact enough for a log line.
+
+    The full payload of the parameters that can carry PII — the tool result
+    and the metadata — is only written when the valve log_tool_payload is on.
+    """
+
+    payload = bool(_active_filter is not None and _active_filter.valves.log_tool_payload)
+
+    if name == "tool_result" and not payload:
+        # The result is exactly what this filter exists to keep out of places
+        # like the log — type and size only, however short it is.
+        size = f" len={len(value)}" if hasattr(value, "__len__") else ""
+        return f"{name}=<{type(value).__name__}{size}>"
+
+    if isinstance(value, (str, bool, int, float)) or value is None:
+        if isinstance(value, str) and not payload and len(value) > 200:
+            return f"{name}=<str len={len(value)}>"
+        return f"{name}={value!r}"
+
+    if isinstance(value, dict):
+        if payload:
+            return f"{name}={value!r}"
+        # Enough to correlate a call with the inlet/outlet lines of the same
+        # request without writing the whole dict into the log.
+        known = {
+            key: value.get(key)
+            for key in ("chat_id", "message_id", "session_id", "user_id", "id")
+            if key in value
+        }
+        return f"{name}={{{', '.join(f'{k}={v!r}' for k, v in known.items())}}} keys={len(value)}"
+
+    if payload:
+        return f"{name}={value!r}"
+
+    size = f" len={len(value)}" if hasattr(value, "__len__") else ""
+    return f"{name}=<{type(value).__name__}{size}>"
+
+
+def _log_tool_call(arguments: Dict[str, Any]) -> None:
+    """Log one call of process_tool_result() with all of its parameters.
+
+    Driven by the bound arguments rather than a fixed list, so parameters
+    added by a future Open WebUI version show up on their own.
+    """
+
+    try:
+        fields = " ".join(
+            _describe_argument(name, value) for name, value in arguments.items()
+        )
+        logging.warning(f"Anymize process_tool_result: {fields}")
+    except Exception as e:
+        logging.warning(f"Anymize process_tool_result logging failed: {e}")
+
+
+async def _event_emitter_for(metadata: Optional[Dict[str, Any]]):
+    """Build an event emitter for a request from its metadata dict.
+
+    process_tool_result() gets no emitter: it lives in the caller as a closure
+    variable and cannot be reached from here. Open WebUI builds its own the
+    same way, from the very dict that is handed to process_tool_result() —
+    get_event_emitter() reads user_id, chat_id and message_id from it and
+    returns None when one of them is missing.
+
+    Never raises: a broken status display must not break the anonymization.
+    """
+
+    if not metadata:
+        return None
+
+    try:
+        from open_webui.socket.main import get_event_emitter
+
+        emitter = get_event_emitter(metadata)
+        # async in current versions, plain function in older ones
+        if inspect.isawaitable(emitter):
+            emitter = await emitter
+
+        return emitter
+    except Exception as e:
+        logging.warning(f"Anymize could not build an event emitter: {e}")
+        return None
+
+
+async def _anonymize_tool_result(tool_result, arguments: Dict[str, Any]):
+    """Hand one tool result to Filter.tool(). Fails closed."""
+
+    if _active_filter is None:
+        # No filter instance registered yet — nothing can be anonymized, and
+        # withholding the result here would break tool calling for a filter
+        # that is not even loaded.
+        return tool_result
+
+    try:
+        return await _active_filter.tool(
+            tool_result,
+            __tool_name__=arguments.get("tool_function_name") or "?",
+            __metadata__=arguments.get("metadata"),
+            __user__=arguments.get("user"),
+        )
+    except Exception as e:
+        # Fail closed: the raw result must never reach the model just because
+        # the wrapper itself broke.
+        logging.warning(f"Anymize tool interception failed: {e}")
+        return (
+            f"❌ Anonymization of the result of "
+            f"{arguments.get('tool_function_name') or 'the tool'} failed: {e}. "
+            f"The result was withheld."
+        )
+
+
+def _install_process_tool_result_patch() -> bool:
+    """Patch middleware.process_tool_result. Idempotent across reloads."""
+
+    try:
+        from open_webui.utils import middleware
+    except Exception as e:
+        logging.warning(f"Anymize: no tool result interception ({e})")
+        return False
+
+    installed = getattr(middleware, "process_tool_result", None)
+    if installed is None:
+        logging.warning(
+            "Anymize: middleware.process_tool_result not found — tool results are "
+            "NOT anonymized on this Open WebUI version"
+        )
+        return False
+
+    # Rebuild from the untouched function, so a patch of an earlier module
+    # object is replaced instead of wrapped a second time.
+    original = _unwrap(installed)
+
+    @functools.wraps(original)
+    async def patched(*args, **kwargs):
+        # Logged before the original runs, so a call that hangs downstream is
+        # still visible in the log.
+        arguments = _bind_tool_call(original, args, kwargs)
+        _log_tool_call(arguments)
+
+        tool_result, tool_result_files, tool_result_embeds = await original(
+            *args, **kwargs
+        )
+        tool_result = await _anonymize_tool_result(tool_result, arguments)
+        return tool_result, tool_result_files, tool_result_embeds
+
+    setattr(patched, _PATCH_FLAG, True)
+    setattr(patched, _PATCH_ORIGINAL, original)
+    middleware.process_tool_result = patched
+
+    if installed is not original:
+        logging.warning(
+            "Anymize: replaced the process_tool_result patch of an older version"
+        )
+
+    logging.warning(f"Anymize {_VERSION}: process_tool_result patch installed")
+    return True
+
 
 class Filter:
     # Fields kept from each entry of GET /api/status/{job_id}/strings
@@ -24,7 +264,6 @@ class Filter:
         "original",
         "hash",
         "prefix_name",
-        "internal_id",
         "placeholder",
     )
 
@@ -32,8 +271,10 @@ class Filter:
     METADATA_HASH_PAIRS_KEY = "_anymize_hash_pairs"
     METADATA_JOB_ID_KEY = "_anymize_job_id"
 
-    # Chunk counter of stream(), kept per request next to the hash pairs
-    METADATA_STREAM_CHUNKS_KEY = "_anymize_stream_chunks"
+    # Job IDs of the tool results anonymized during this request, in call
+    # order. Kept apart from METADATA_JOB_ID_KEY, which stays the job of the
+    # input anonymization done in inlet().
+    METADATA_TOOL_JOB_IDS_KEY = "_anymize_tool_job_ids"
 
     # Field of a hash pair that carries the full token as it appears in the
     # anonymized text, e.g. "[[internal_id-S28MBV]]"
@@ -89,6 +330,17 @@ class Filter:
             },
         )
 
+        tool_filter: bool = Field(
+            default=True,
+            description=(
+                "Anonymize the result of every tool call before it reaches the "
+                "model. Needs the monkey patch of middleware.process_tool_result "
+                "that is installed when this filter loads; tool results never "
+                "reach inlet/stream/outlet. If the anonymization fails, the "
+                "result is withheld from the model."
+            ),
+        )
+
         allowed_categories: str = Field(
             default="",
             description=(
@@ -110,14 +362,30 @@ class Filter:
             ),
         )
 
+        log_tool_payload: bool = Field(
+            default=False,
+            description=(
+                "Log the result of each tool call before and after anonymization. "
+                "WARNING: writes the raw tool result in clear text into the server "
+                "log. Off means one compact line per tool result with lengths only."
+            ),
+        )
+
         priority: int = Field(
             default=10, description="Filter execution order, Lower values run first"
         )
         pass
 
     def __init__(self):
+        global _active_filter
+
         self.toggle = True
         self.valves = self.Valves()
+
+        # The tool result wrapper lives at module level and reads the valves
+        # from here.
+        _active_filter = self
+        _install_process_tool_result_patch()
         self.icon = """data:image/svg+xml,%3C%3Fxml%20version%3D%221.0%22%20encoding%3D%22UTF-8%22%3F%3E%3Csvg%20id%3D%22Ebene_2%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2064%2050.57%22%3E%3Cg%20id%3D%22Ebene_1-2%22%3E%3Cpath%20d%3D%22M62.5%2C43.07c-.97-.62-1.94-1.41-1.94-3.01v-22.54c0-7.63-3.88-12.48-9.98-14.75v39.66s.06-.05.08-.08c.62%2C3.54%2C3.45%2C5.75%2C7.87%2C5.75%2C3.01%2C0%2C5.48-.97%2C5.48-2.83%2C0-1.06-.71-1.59-1.5-2.21Z%22%2F%3E%3Cpath%20d%3D%22M21.13%2C36.09c0-10.78%2C12.73-14.85%2C29.34-15.03v-5.39c0-7.34-4.15-10.78-10.08-10.78s-6.89%2C3.36-7.69%2C6.54c-.71%2C2.83-1.33%2C5.39-5.21%2C5.39-3.01%2C0-4.69-1.77-4.69-4.42%2C0-5.3%2C6.54-11.14%2C18.38-11.14%2C3.47%2C0%2C6.65.5%2C9.38%2C1.52V0H0v50.57h50.57v-8.14c-3.53%2C3.58-8.62%2C5.67-14.59%2C5.67-8.84%2C0-14.85-4.68-14.85-12.02Z%22%2F%3E%3Cpath%20d%3D%22M31.03%2C33.96c0%2C5.13%2C4.51%2C8.57%2C10.16%2C8.57%2C3.71%2C0%2C7.16-1.5%2C9.28-3.98v-12.46c-1.59-.8-3.45-1.06-5.75-1.06-8.04%2C0-13.7%2C3.27-13.7%2C8.93Z%22%2F%3E%3C%2Fg%3E%3C%2Fsvg%3E"""
         pass
 
@@ -207,7 +475,10 @@ class Filter:
         return await self._anymize_api_request("GET", f"/api/status/{job_id}/strings")
 
     async def _store_hash_pairs(
-        self, job_id: str, metadata: Optional[Dict[str, Any]] = None
+        self,
+        job_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        is_tool_result: bool = False,
     ) -> List[Dict[str, Any]]:
 
         try:
@@ -222,8 +493,19 @@ class Filter:
         ]
 
         if metadata is not None:
-            metadata[self.METADATA_HASH_PAIRS_KEY] = hash_pairs
-            metadata[self.METADATA_JOB_ID_KEY] = job_id
+            # Append instead of assign: a request runs one anonymization for the
+            # user message and one more per tool result, and the pairs of the
+            # earlier jobs must survive.
+            metadata[self.METADATA_HASH_PAIRS_KEY] = (
+                metadata.get(self.METADATA_HASH_PAIRS_KEY) or []
+            ) + hash_pairs
+
+            if is_tool_result:
+                metadata[self.METADATA_TOOL_JOB_IDS_KEY] = (
+                    metadata.get(self.METADATA_TOOL_JOB_IDS_KEY) or []
+                ) + [job_id]
+            else:
+                metadata[self.METADATA_JOB_ID_KEY] = job_id
 
         if not hash_pairs:
             logging.warning(f"Anonymize hash pairs for job {job_id}: none returned")
@@ -403,6 +685,64 @@ class Filter:
                 )
             return []
 
+    async def _anonymize_content(
+        self,
+        text: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        is_tool_result: bool = False,
+        context: str = "",
+    ) -> tuple:
+        """Anonymize one piece of text end to end: submit, poll, mask.
+
+        Returns the masked text and the completed status response, so the
+        caller can still reach fields like "systemprompt". Shared by
+        process_input() and tool() so both take the same path through the
+        category valves.
+        """
+
+        response = await self._anonymize_text(text, self.valves.language)
+        job_id = response["job_id"]
+        logging.warning(f"Anonymize JobID: {job_id}{context}")
+
+        result = await self._poll_status(job_id)
+        hash_pairs = await self._store_hash_pairs(job_id, metadata, is_tool_result)
+
+        if self.local_processing and hash_pairs:
+            # Category valves are set: mask locally from the hash pairs
+            # instead of using the text the API returned.
+            final_content = self._anonymize_locally(text, hash_pairs)
+            logging.warning(
+                f"Aonymize job {job_id}: anonymized locally from "
+                f"{len(hash_pairs)} hash pairs (before category filtering)"
+            )
+            if final_content == text:
+                logging.warning(
+                    f"Anonymize local anonymization for job {job_id} "
+                    f"replaced nothing — the message goes to the model unmasked"
+                )
+        else:
+            # Either no category valve is set, or there are no hash pairs to
+            # work with. The latter is what Zero Data Retention looks like
+            # from here: ZDR is an account setting, not a request parameter,
+            # and with it enabled the backend keeps no placeholder-to-original
+            # mapping, so GET /api/status/{job_id}/strings returns nothing.
+            # The local path would then replace nothing and send the original
+            # message in clear text, so fall back to the text the API masked.
+            if self.local_processing:
+                logging.warning(
+                    f"Anonymize job {job_id}: no hash pairs available "
+                    f"(Zero Data Retention enabled?) — using the anonymized text "
+                    f"from the API instead of local anonymization"
+                )
+            else:
+                logging.warning(
+                    f"Anonymize job {job_id}: using the anonymized "
+                    f"text from the API"
+                )
+            final_content = result["anonymized_text_raw"]
+
+        return final_content, result
+
     async def process_input(
         self,
         body,
@@ -473,48 +813,9 @@ class Filter:
                 }
             )
 
-            response = await self._anonymize_text(
-                content_to_anonymize, self.valves.language
+            final_content, result = await self._anonymize_content(
+                content_to_anonymize, metadata
             )
-            logging.warning(f"Anonymize JobID: {response['job_id']}")
-            result = await self._poll_status(response["job_id"])
-            hash_pairs = await self._store_hash_pairs(response["job_id"], metadata)
-
-            if self.local_processing and hash_pairs:
-                # Category valves are set: mask locally from the hash pairs
-                # instead of using the text the API returned.
-                final_content = self._anonymize_locally(
-                    content_to_anonymize, hash_pairs
-                )
-                logging.warning(
-                    f"Aonymize job {response['job_id']}: anonymized locally from "
-                    f"{len(hash_pairs)} hash pairs (before category filtering)"
-                )
-                if final_content == content_to_anonymize:
-                    logging.warning(
-                        f"Anonymize local anonymization for job {response['job_id']} "
-                        f"replaced nothing — the message goes to the model unmasked"
-                    )
-            else:
-                # Either no category valve is set, or there are no hash pairs to
-                # work with. The latter is what Zero Data Retention looks like
-                # from here: ZDR is an account setting, not a request parameter,
-                # and with it enabled the backend keeps no placeholder-to-original
-                # mapping, so GET /api/status/{job_id}/strings returns nothing.
-                # The local path would then replace nothing and send the original
-                # message in clear text, so fall back to the text the API masked.
-                if self.local_processing:
-                    logging.warning(
-                        f"Anonymize job {response['job_id']}: no hash pairs available "
-                        f"(Zero Data Retention enabled?) — using the anonymized text "
-                        f"from the API instead of local anonymization"
-                    )
-                else:
-                    logging.warning(
-                        f"Anonymize job {response['job_id']}: using the anonymized "
-                        f"text from the API"
-                    )
-                final_content = result["anonymized_text_raw"]
 
             # Combine anonymized content with system prompt
             if result.get("systemprompt"):
@@ -578,6 +879,101 @@ class Filter:
 
             raise Exception(f"Anonymization failed: {str(e)}")
 
+    async def tool(
+        self,
+        tool_result: Optional[str],
+        __tool_name__: str = "?",
+        __metadata__: Optional[Dict[str, Any]] = None,
+        __user__: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Anonymize the result of one tool call before the model sees it.
+
+        Not an Open WebUI hook: it is called from the monkey patch of
+        middleware.process_tool_result() installed when this module loads,
+        after the original has normalized the result to a string.
+
+        Fails closed. If the anonymization fails, the raw result is replaced by
+        an error message instead of being handed to the model in clear text —
+        the model then sees a failed tool call and the chat keeps running.
+        """
+
+        if not self.toggle or not self.valves.tool_filter:
+            return tool_result
+
+        if not isinstance(tool_result, str) or not tool_result.strip():
+            return tool_result
+
+        # Built from __metadata__ rather than passed in — see _event_emitter_for().
+        # Stays None outside a live chat request; every status is then skipped.
+        event_emitter = await _event_emitter_for(__metadata__)
+
+        async def status(description: str, done: bool, hidden: bool) -> None:
+            if event_emitter is None:
+                return
+            try:
+                await event_emitter(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": description,
+                            "done": done,
+                            "hidden": hidden,
+                        },
+                    }
+                )
+            except Exception as e:
+                logging.warning(f"Anonymize tool_result status failed: {e}")
+
+        try:
+            if self.valves.log_tool_payload:
+                logging.warning(
+                    f"Anonymize tool_result before: name={__tool_name__} "
+                    f"{tool_result!r}"
+                )
+
+            await status(f"Anonymizing result of {__tool_name__}...", False, False)
+
+            final_content, _ = await self._anonymize_content(
+                tool_result,
+                __metadata__,
+                is_tool_result=True,
+                context=f" (tool {__tool_name__})",
+            )
+
+            # The systemprompt of the status response is deliberately not
+            # appended here: it belongs on the user message, where inlet()
+            # already put it, not into a role="tool" message.
+
+            if self.valves.log_tool_payload:
+                logging.warning(
+                    f"Anonymize tool_result after: name={__tool_name__} "
+                    f"{final_content!r}"
+                )
+            else:
+                logging.warning(
+                    f"Anonymize tool_result: name={__tool_name__} "
+                    f"len={len(tool_result)} -> {len(final_content)}"
+                )
+
+            await status("", False, True)
+
+            return final_content
+
+        except Exception as e:
+            logging.warning(
+                f"Anonymize tool_result failed: name={__tool_name__} "
+                f"len={len(tool_result)}: {e} — result withheld from the model"
+            )
+            await status(
+                f"❌ Anonymization of the result of {__tool_name__} failed: {e}",
+                True,
+                False,
+            )
+            return (
+                f"❌ Anonymization of the result of {__tool_name__} failed: {e}. "
+                f"The result was withheld."
+            )
+
     async def stream(
         self,
         event: dict,
@@ -585,32 +981,12 @@ class Filter:
         __metadata__: Optional[Dict[str, Any]] = None,
         __user__: Optional[Dict[str, Any]] = None,
     ) -> dict:
-        """Log every chunk of a streamed response and pass it through untouched.
+        """Pass every chunk of a streamed response through untouched.
 
-        Prototype: this hook observes only. De-anonymization still happens in
-        outlet() on the finished message. Every parameter but the event has a
-        default because it is not guaranteed which extras Open WebUI injects
-        on the stream path.
+        De-anonymization happens in outlet() on the finished message. Every
+        parameter but the event has a default because it is not guaranteed
+        which extras Open WebUI injects on the stream path.
         """
-
-        if not self.toggle:
-            return event
-
-        try:
-            # The counter lives in __metadata__, not on the instance: Open WebUI
-            # shares one Filter across all users and chats, so instance state
-            # would mix up concurrent responses.
-            chunk = "?"
-            if __metadata__ is not None:
-                chunk = __metadata__.get(self.METADATA_STREAM_CHUNKS_KEY, 0) + 1
-                __metadata__[self.METADATA_STREAM_CHUNKS_KEY] = chunk
-
-            logging.warning(f"Anonymize stream chunk {chunk}: {event!r}")
-
-        except Exception as e:
-            # Never raise from here — an exception would tear down the response
-            # mid-stream, and this hook only observes.
-            logging.warning(f"Anonymize stream logging failed: {e}")
 
         return event
 
