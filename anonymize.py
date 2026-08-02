@@ -1,7 +1,7 @@
 """
-title: anymize
-author: bbojan
-author_url: https://github.com/Bojan227
+title: anonymize.py
+description: "Filter for anonymizing and deanonymizing text and files using an external API. The filter can be toggled on/off and configured via valves."
+author: MatIas
 version: 1.0.0
 """
 
