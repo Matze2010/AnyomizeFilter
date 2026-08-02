@@ -2,7 +2,7 @@
 title: anonymize.py
 description: "Filter for anonymizing and deanonymizing text and files using an external API. The filter can be toggled on/off and configured via valves."
 author: Mathias Gisch
-version: 1.3.0
+version: 1.4.0
 """
 
 import asyncio
@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 # Logged when the patch is installed. Open WebUI shows no version anywhere, so
 # this is the only way to tell from a log which source is actually running.
-_VERSION = "1.3.0"
+_VERSION = "1.4.0"
 
 # Marks a function this module has already wrapped, so that reloading the
 # filter in Open WebUI does not stack wrapper upon wrapper.
@@ -192,6 +192,19 @@ def _parse_tool_patterns(raw: Optional[str]) -> List[str]:
         return []
 
     return [part.strip().lower() for part in raw.split(",") if part.strip()]
+
+
+def _parse_label_ids(raw: Optional[str]) -> List[str]:
+    """Split the comma-separated label_ids valve into single label IDs.
+
+    Unlike _parse_tool_patterns() the entries keep their case: they are sent
+    to the backend as they are, and label IDs may well be case-sensitive.
+    """
+
+    if not raw:
+        return []
+
+    return [part.strip() for part in raw.split(",") if part.strip()]
 
 
 def _tool_excluded(tool_name: str, raw: Optional[str]) -> bool:
@@ -339,6 +352,17 @@ class Filter:
             },
         )
 
+        label_ids: str = Field(
+            default="",
+            description=(
+                "Comma-separated label IDs sent as 'label_ids' with every "
+                "POST /api/anonymize call, restricting which entity types are "
+                "detected and masked, e.g. 'PERSON, IBAN'. Values are sent "
+                "unchanged, case-sensitive. Empty means the field is omitted "
+                "and the backend applies its own default set of labels."
+            ),
+        )
+
         input_filter: str = Field(
             "text_anonymization",
             description="Controls how sensitive data in the input is processed before analysis",
@@ -475,12 +499,22 @@ class Filter:
 
         raise Exception(error_message)
 
-    async def _anonymize_text(self, text: str, language: str = "de") -> Dict[str, Any]:
+    async def _anonymize_text(
+        self,
+        text: str,
+        language: str = "de",
+        label_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
 
-        body = {
+        body: Dict[str, Any] = {
             "text": text,
             "language": language,
         }
+
+        # An empty selection stays out of the body entirely, so the backend
+        # keeps applying its own default set of labels.
+        if label_ids:
+            body["label_ids"] = label_ids
 
         return await self._anymize_api_request("POST", "/api/anonymize", body)
 
@@ -682,7 +716,11 @@ class Filter:
         process_input() and tool() so both take the same path.
         """
 
-        response = await self._anonymize_text(text, self.valves.language)
+        response = await self._anonymize_text(
+            text,
+            self.valves.language,
+            _parse_label_ids(self.valves.label_ids),
+        )
         job_id = response["job_id"]
         logging.warning(f"Anonymize JobID: {job_id}{context}")
 

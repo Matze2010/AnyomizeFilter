@@ -90,6 +90,7 @@ sequenceDiagram
 | `backend_url` | z.B. `https://app.anymize.ai` | Basis-URL des anymize-Backends, ohne Pfad. Nur ändern, um eine self-hosted oder Staging-Instanz anzusprechen. Ein abschließender `/` wird abgeschnitten; leer gelassen greift wieder der Default. |
 | `anymize_api_key` | `""` | API-Key des Backends, Format z.B. `anymize_xxxxxxxxxxxxx`. Wird als `Authorization: Bearer …` gesendet. |
 | `language` | `de` | Sprache der PII-Erkennung; gilt für `/api/anonymize` **und** `/api/ocr`. Mögliche Werte: `de`, `en`, `fr`, `es`, `it`. |
+| `label_ids` | `""` | Kommagetrennte Liste von Label-IDs, die als `label_ids` bei jedem `POST /api/anonymize` mitgeschickt wird und die Erkennung auf diese Entitätstypen einschränkt, z.B. `PERSON, IBAN`. Die Werte gehen unverändert raus, Groß-/Kleinschreibung zählt. Gilt für User-Input **und** Tool-Ergebnisse, nicht für `/api/ocr`. Leer = das Feld wird gar nicht gesendet, es greift der Default des Backends. |
 | `input_filter` | `text_anonymization` | Was vor dem LLM verarbeitet wird — siehe Modi unten. |
 | `output_filter` | `deanonymized` | Was mit der LLM-Antwort passiert — siehe unten. |
 | `tool_filter` | `true` | Maskiert das Ergebnis jedes Tool-Calls, bevor es das Modell sieht — siehe [Tool-Ergebnisse](#tool-ergebnisse). Braucht den Monkey Patch von `middleware.process_tool_result`, der beim Laden des Filters installiert wird. |
@@ -121,7 +122,7 @@ Basis-URL: die Valve `backend_url`, per Default `https://app.anymize.ai`. Auth �
 
 | Endpoint | Zweck | Aufruf im Code |
 |---|---|---|
-| `POST /api/anonymize` | Text maskieren, liefert `job_id` | [`_anonymize_text()`](anonymize.py:431) |
+| `POST /api/anonymize` | Text maskieren, liefert `job_id`; Body `text` + `language`, dazu optional `label_ids` aus der gleichnamigen Valve | [`_anonymize_text()`](anonymize.py:431) |
 | `GET /api/status/{job_id}` | Job-Status + `anonymized_text_raw` + `systemprompt` | [`_get_anonymization_status()`](anonymize.py:440) |
 | `GET /api/status/{job_id}/strings` | Zuordnungstabelle Platzhalter ↔ Originalwert; nur bei gesetzter Valve `store_hash_pairs`, wird dann in `__metadata__` abgelegt und von `outlet()` ins Serverlog geschrieben | [`_get_hash_pairs()`](anonymize.py:444), [`_store_hash_pairs()`](anonymize.py:448), [`_log_hash_pairs()`](anonymize.py:489) |
 | `POST /api/deanonymize` | Platzhalter zurück in Originalwerte | [`_deanonymize_text()`](anonymize.py:518) |
