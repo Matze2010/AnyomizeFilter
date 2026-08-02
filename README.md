@@ -1,4 +1,4 @@
-# AnymizeFilter
+# AnonymizeFilter
 
 Ein [Open WebUI](https://github.com/open-webui/open-webui)-Filter, der personenbezogene Daten (PII) aus Chat-Eingaben entfernt, bevor sie an ein LLM gehen — und sie in der Antwort wieder einsetzt.
 
@@ -15,7 +15,7 @@ sequenceDiagram
     participant U as Nutzer
     participant OWUI as Open WebUI
     participant F as AnymizeFilter
-    participant A as anymize.ai API
+    participant A as Backend
     participant LLM as LLM
 
     U->>OWUI: Nachricht (+ optional Dateien)
@@ -218,7 +218,7 @@ Welcher Pfad gegriffen hat, steht in jedem Fall im Log:
 | API-Text, keine Valves gesetzt | `using the anonymized text from the API` |
 | API-Text, weil keine Hash-Paare da sind | `no hash pairs available (Zero Data Retention enabled?) — using the anonymized text from the API instead of local anonymization` |
 
-**Rückfall auf den API-Text ohne Hash-Paare**: Zero Data Retention ist eine Kontoeinstellung, kein Request-Parameter — von hier aus sichtbar wird sie nur daran, dass `GET /api/status/{job_id}/strings` nichts liefert, weil anymize.ai unter ZDR keine Zuordnung speichert. Ohne Paare würde der lokale Pfad nichts ersetzen und die Original-Nachricht im Klartext ans Modell schicken; deshalb greift dann der API-Text, begleitet von einer Warnung im Log. Dasselbe gilt, wenn der Abruf der Tabelle fehlgeschlagen ist oder die API keine PII erkannt hat.
+**Rückfall auf den API-Text ohne Hash-Paare**: Zero Data Retention ist eine Kontoeinstellung, kein Request-Parameter — von hier aus sichtbar wird sie nur daran, dass `GET /api/status/{job_id}/strings` nichts liefert, weil das Backend unter ZDR keine Zuordnung speichert. Ohne Paare würde der lokale Pfad nichts ersetzen und die Original-Nachricht im Klartext ans Modell schicken; deshalb greift dann der API-Text, begleitet von einer Warnung im Log. Dasselbe gilt, wenn der Abruf der Tabelle fehlgeschlagen ist oder die API keine PII erkannt hat.
 
 ⚠️ **Sonst kann der lokale Pfad weiterhin Klartext ans LLM schicken.** Er maskiert nur, was in der gefilterten Zuordnungstabelle steht:
 
@@ -233,7 +233,7 @@ Welcher Pfad gegriffen hat, steht in jedem Fall im Log:
 
 - **Open WebUI** — der Filter importiert `open_webui.utils.misc.get_last_user_message` / `get_last_assistant_message` und `open_webui.config.UPLOAD_DIR`. Außerhalb von Open WebUI läuft die Datei nicht.
 - **Python-Pakete**: `aiohttp`, `pydantic` (beide in Open WebUI bereits vorhanden).
-- **anymize.ai-Account** mit API-Key.
+- API-Key eines Anonymisierungs-Dienstes.
 - Für die De-Anonymisierung gilt laut API-Doku: der ursprüngliche Anonymisierungs-Job muss noch existieren, **Zero Data Retention (ZDR) muss im Account deaktiviert sein**, und nur derselbe Nutzer, der den Job erzeugt hat, darf de-anonymisieren. Mit aktivem ZDR liefert `/api/deanonymize` keine Originalwerte — dann ist nur `output_filter = "anonymized"` sinnvoll.
 
 ---
@@ -245,7 +245,7 @@ Stand der aktuellen Fassung von `anonymize.py` (Version 1.0.0):
 - **Langes blockierendes Polling**: `_poll_status()` versucht es bis zu 150-mal im Abstand von 10 s ([anonymize.py:176](anonymize.py:176)) — im Extremfall hängt eine Anfrage 25 Minuten, bevor der Timeout greift.
 - **Keine Streaming-De-Anonymisierung**: `stream()` existiert, ersetzt aber nichts — es protokolliert nur. Die De-Anonymisierung bleibt in `outlet()` auf der fertigen Nachricht, der Nutzer sieht während der Ausgabe weiterhin die rohen Platzhalter.
 - **Nur die letzte User-Message wird anonymisiert**: Ältere Nachrichten des Verlaufs gehen unverändert ans LLM. In laufenden Unterhaltungen können frühere Klartext-PII also weiterhin mitgeschickt werden.
-- **Job-ID im Log**: `logging.warning(f"Anymize.ai JobID: …")` ([anonymize.py:479](anonymize.py:479)) schreibt die Job-ID jeder Anonymisierung auf Warn-Level ins Serverlog.
+- **Job-ID im Log**: `logging.warning(f"Anymize JobID: …")` ([anonymize.py:479](anonymize.py:479)) schreibt die Job-ID jeder Anonymisierung auf Warn-Level ins Serverlog.
 - **`__metadata__` ist nicht in jedem Aufrufpfad garantiert**: Laut Open-WebUI-Doku läuft `outlet()` bei WebUI-Requests und über `/api/chat/completed`; für direkte Aufrufe von `/api/chat/completions` braucht es `ENABLE_API_OUTLET_FILTERS` auf `dev`/kommenden Releases. In Pfaden ohne Metadata stehen die Hash-Paare nur im Log, nicht im Dict.
 - **Der lokale Pfad maskiert weniger als die API**: Ist eine Kategorie-Valve gesetzt, ersetzt der Filter nur, was in der gefilterten Zuordnungstabelle steht. Fehlen Paare ganz (ZDR), greift der API-Text; filtern die Valves dagegen alle vorhandenen Paare weg, geht die Original-Nachricht im Klartext ans LLM — mit Warnung im Log, ohne Abbruch. Siehe [Auswahl des Pfads](#auswahl-des-pfads).
 - **Die De-Anonymisierung in `outlet()` ist ab Open WebUI 0.10 unsichtbar**: `outlet()` schreibt das Ergebnis nur nach `message["content"]` ([anymize.py:645](anonymize.py:645)), das Frontend rendert eine Assistant-Nachricht seit 0.10 aber aus den strukturierten `message["output"]`-Blöcken und greift auf `content` nur zurück, wenn keine da sind (`ContentRenderer.svelte`: `{#if output?.length}`). Bei einer gestreamten Antwort sind sie immer da — sichtbar bleibt der aus den Stream-Chunks zusammengesetzte Text mit Platzhaltern. Dasselbe gilt für die Fehlermeldung im `except`-Zweig ([anonymize.py:673](anonymize.py:673)). Nötig ist, `content` **und** `output` zu schreiben; das Backend vergleicht beide getrennt und speichert beide. Ein Proof of Concept dafür steckt in [`hook_logger.py`](hook_logger.py) hinter der Valve `outlet_overwrite`.
@@ -254,7 +254,7 @@ Stand der aktuellen Fassung von `anonymize.py` (Version 1.0.0):
 
 ## Datenschutz-Hinweis
 
-Der Filter schickt Chat-Inhalte und hochgeladene Dateien an `app.anymize.ai` — die Daten verlassen also die eigene Infrastruktur, bevor sie maskiert sind. Das ist bauartbedingt: die Erkennung der PII passiert bei anymize.ai, nicht lokal. Ob das zulässig ist, hängt vom Einsatzzweck und der vertraglichen Grundlage (Auftragsverarbeitung) ab.
+Der Filter schickt Chat-Inhalte und hochgeladene Dateien an externe APIs — die Daten verlassen also die eigene Infrastruktur, bevor sie maskiert sind. Das ist bauartbedingt: die Erkennung der PII passiert extern, nicht lokal. Ob das zulässig ist, hängt vom Einsatzzweck und der vertraglichen Grundlage (Auftragsverarbeitung) ab.
 
 **Die Zuordnungstabelle landet im Log**: Nach jeder Text-Anonymisierung ruft `_store_hash_pairs()` die Hash-Paare ab und schreibt sie per `logging.warning` ins Open-WebUI-Serverlog — inklusive der Originalwerte im Klartext (`original='Max Mustermann'`). Die PII steht damit unmaskiert an einer Stelle, die der Filter sonst gerade schützt; wer Logs weiterleitet, aggregiert oder langfristig aufbewahrt, sollte das einkalkulieren. Abschalten geht nur durch Entfernen des Aufrufs in `process_input()`.
 
@@ -262,7 +262,7 @@ Der Filter schickt Chat-Inhalte und hochgeladene Dateien an `app.anymize.ai` —
 
 Die zweite Kopie in `__metadata__` ist dagegen auf den einzelnen Request begrenzt und wird mit ihm verworfen — kein geteilter Zustand zwischen Nutzern oder Chats.
 
-Zero Data Retention ist eine Kontoeinstellung bei anymize.ai, kein Request-Parameter. Mit ZDR speichert anymize.ai keine Zuordnung zwischen Platzhalter und Originalwert — dann funktioniert die De-Anonymisierung in `outlet()` nicht mehr, die Zuordnungstabelle landet weder im Log noch in `__metadata__`, und die lokale Anonymisierung fällt auf den API-Text zurück.
+Zero Data Retention ist eine Kontoeinstellung, kein Request-Parameter. Mit ZDR speichert das Backend keine Zuordnung zwischen Platzhalter und Originalwert — dann funktioniert die De-Anonymisierung in `outlet()` nicht mehr, die Zuordnungstabelle landet weder im Log noch in `__metadata__`, und die lokale Anonymisierung fällt auf den API-Text zurück.
 
 ---
 
