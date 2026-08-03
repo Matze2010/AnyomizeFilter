@@ -487,7 +487,7 @@ class Filter:
         self,
         job_id: str,
         max_retries: int = 150,
-        retry_interval: int = 10000,
+        retry_interval: int = 500,
         error_message: str = "Anonymization timeout: Process did not complete within expected time",
     ) -> Dict[str, Any]:
 
