@@ -2,7 +2,7 @@
 title: anonymize.py
 description: "Filter for anonymizing and deanonymizing text and files using an external API. The filter can be toggled on/off and configured via valves."
 author: Mathias Gisch
-version: 1.5.0
+version: 1.6.0
 """
 
 import asyncio
@@ -10,12 +10,13 @@ import aiohttp
 import fnmatch
 import functools
 import inspect
+import json
 import os
 import logging
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 
-from open_webui.utils.misc import get_last_user_message, get_last_assistant_message
+from open_webui.utils.misc import get_last_user_message
 from open_webui.config import UPLOAD_DIR
 
 logger = logging.getLogger(__name__)
@@ -49,7 +50,7 @@ logger = logging.getLogger(__name__)
 
 # Logged when the patch is installed. Open WebUI shows no version anywhere, so
 # this is the only way to tell from a log which source is actually running.
-_VERSION = "1.5.0"
+_VERSION = "1.6.0"
 
 # Marks a function this module has already wrapped, so that reloading the
 # filter in Open WebUI does not stack wrapper upon wrapper.
@@ -78,6 +79,14 @@ _active_filter = None
 _OWN_FUNCTION_ID = (
     __name__[len("function_"):] if __name__.startswith("function_") else None
 )
+
+# Shape of a placeholder in the masked text: [[Type-HASH]], e.g.
+# [[Person-HGCVVW]]. _PLACEHOLDER_MAX_LEN is the point at which an unclosed
+# `[[` in a stream chunk is treated as ordinary text instead of the beginning
+# of a placeholder — see _split_pending().
+_PLACEHOLDER_OPEN = "[["
+_PLACEHOLDER_CLOSE = "]]"
+_PLACEHOLDER_MAX_LEN = 64
 
 
 def _unwrap(fn):
@@ -216,6 +225,89 @@ def _parse_label_ids(raw: Optional[str]) -> List[str]:
         return []
 
     return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def _placeholder_map(
+    metadata: Optional[Dict[str, Any]], for_json: bool = False
+) -> List[Tuple[str, str]]:
+    """Placeholder -> original from the pairs collected during this request.
+
+    for_json escapes the original with json.dumps(), quotes stripped. stream()
+    needs that: function.arguments is JSON *text*, and an original containing a
+    quote, a backslash or a newline would break it. ensure_ascii stays off, so
+    an umlaut reaches the tool as itself instead of as an escape sequence.
+    outlet() works on the answer text and takes the value raw — an escaped `\\"`
+    in the middle of a sentence would be plain wrong there.
+
+    Sorted by placeholder length, longest first, so that no placeholder is
+    destroyed by the replacement of another one that is a prefix of it.
+
+    Empty unless output_filter is "deanonymized" — that mode is what fetches
+    the mapping in the first place.
+    """
+
+    if not isinstance(metadata, dict):
+        return []
+
+    pairs = metadata.get(Filter.METADATA_HASH_PAIRS_KEY) or []
+
+    mapping = {}
+    for pair in pairs:
+        if not isinstance(pair, dict):
+            continue
+
+        placeholder = pair.get("placeholder")
+        original = pair.get("original")
+        if not placeholder or original is None:
+            continue
+
+        original = str(original)
+        mapping[str(placeholder)] = (
+            json.dumps(original, ensure_ascii=False)[1:-1] if for_json else original
+        )
+
+    return sorted(mapping.items(), key=lambda item: len(item[0]), reverse=True)
+
+
+def _replace_placeholders(
+    text: str, mapping: List[Tuple[str, str]]
+) -> Tuple[str, List[str]]:
+    """Replace every known placeholder in text. Returns the ones actually hit."""
+
+    replaced = []
+    for placeholder, original in mapping:
+        if placeholder in text:
+            text = text.replace(placeholder, original)
+            replaced.append(placeholder)
+
+    return text, replaced
+
+
+def _split_pending(text: str) -> Tuple[str, str]:
+    """Split into the part that can be emitted and the tail to hold back.
+
+    A placeholder arrives in fragments during streaming, so the tail of a chunk
+    may be the beginning of one: `[[Per` now, `son-HGCVVW]]` in the next chunk.
+    Emitting it right away would hand the model's placeholder to the tool.
+
+    Held back is therefore the last unclosed `[[`, and a single trailing `[`
+    whose second bracket may still follow. _PLACEHOLDER_MAX_LEN caps this: an
+    unclosed `[[` that long is ordinary text, not a placeholder, and must not
+    be held for the rest of the stream.
+    """
+
+    start = text.rfind(_PLACEHOLDER_OPEN)
+    if (
+        start != -1
+        and text.find(_PLACEHOLDER_CLOSE, start + len(_PLACEHOLDER_OPEN)) == -1
+        and len(text) - start <= _PLACEHOLDER_MAX_LEN
+    ):
+        return text[:start], text[start:]
+
+    if text.endswith("["):
+        return text[:-1], "["
+
+    return text, ""
 
 
 def _tool_excluded(tool_name: str, raw: Optional[str]) -> bool:
@@ -360,6 +452,16 @@ class Filter:
         "placeholder",
     )
 
+    # Fields of a hash pair that may be written to the log. "original" is
+    # deliberately not among them: the log line runs on every request in mode
+    # "deanonymized", and the original value is exactly the PII this filter
+    # keeps away from everything else.
+    HASH_PAIR_LOG_FIELDS = (
+        "placeholder",
+        "hash",
+        "prefix_name",
+    )
+
     # Keys used to hand the hash pairs from inlet() to outlet() via __metadata__
     METADATA_HASH_PAIRS_KEY = "_anymize_hash_pairs"
     METADATA_JOB_ID_KEY = "_anymize_job_id"
@@ -368,6 +470,14 @@ class Filter:
     # order. Kept apart from METADATA_JOB_ID_KEY, which stays the job of the
     # input anonymization done in inlet().
     METADATA_TOOL_JOB_IDS_KEY = "_anymize_tool_job_ids"
+
+    # Per request state of stream(): the tail of every tool call held back
+    # because it may still grow into a placeholder, keyed by tool call index.
+    METADATA_TOOL_CALL_BUFFER_KEY = "_anymize_tool_call_buffer"
+
+    # Set once stream() has reported that no mapping is available, so the
+    # warning is written once per request instead of once per chunk.
+    METADATA_NO_PAIRS_LOGGED_KEY = "_anymize_tool_call_no_pairs_logged"
 
     class Valves(BaseModel):
         backend_url: str = Field(
@@ -421,7 +531,15 @@ class Filter:
         )
         output_filter: str = Field(
             "deanonymized",
-            description="Controls how sensitive data is handled in the response output",
+            description=(
+                "Controls how sensitive data is handled in the response output, "
+                "and with it everything the original values are needed for: "
+                "'deanonymized' fetches the placeholder-to-original mapping after "
+                "every anonymization, puts the originals back into the arguments "
+                "of a streamed tool call before the tool runs, and back into the "
+                "answer. 'anonymized' fetches nothing and leaves every placeholder "
+                "in place — including in the tool call arguments."
+            ),
             json_schema_extra={
                 "enum": [
                     "anonymized",
@@ -450,17 +568,6 @@ class Filter:
                 "'get_time, enaio_*'. Only effective while tool_filter is on. "
                 "WARNING: the result of an excluded tool reaches the model in "
                 "clear text. Empty means every tool result is anonymized."
-            ),
-        )
-
-        store_hash_pairs: bool = Field(
-            default=False,
-            description=(
-                "After every successful anonymization, fetch the placeholder-to-"
-                "original mapping from GET /api/status/{job_id}/strings and keep it "
-                "in __metadata__ for the rest of the request; outlet() then logs the "
-                "collected table once. WARNING: writes the original values in clear "
-                "text into the server log. Off means the mapping is never fetched."
             ),
         )
 
@@ -507,6 +614,19 @@ class Filter:
         """
 
         return self.valves.backend_url.strip().rstrip("/") or "https://app.anymize.ai"
+
+    @property
+    def _deanonymize(self) -> bool:
+        """True when this request needs the original values back.
+
+        output_filter is the single switch: it decides whether the mapping is
+        fetched at all, whether stream() restores the arguments of a tool call,
+        and whether outlet() restores the answer. Anything else would let the
+        two drift apart — a tool called with [[Person-HGCVVW]] because the
+        mapping was never fetched is exactly the case this avoids.
+        """
+
+        return self.valves.output_filter == "deanonymized"
 
     async def _anymize_api_request(
         self,
@@ -583,7 +703,7 @@ class Filter:
         is_tool_result: bool = False,
     ) -> List[Dict[str, Any]]:
 
-        if not self.valves.store_hash_pairs:
+        if not self._deanonymize:
             return []
 
         try:
@@ -621,8 +741,12 @@ class Filter:
         """Log the mapping collected during this request, once, at the end.
 
         The pairs of every job of the request are written in one place instead
-        of one block per anonymization. Nothing was collected when the valve
-        store_hash_pairs is off, and then nothing is logged either.
+        of one block per anonymization. Nothing was collected in mode
+        "anonymized", and then nothing is logged either.
+
+        Without the original values: this line is not behind a valve of its own
+        any more, so it would otherwise put the PII of every request into the
+        server log — see HASH_PAIR_LOG_FIELDS.
         """
 
         if metadata is None:
@@ -637,7 +761,10 @@ class Filter:
 
         pairs = "\n".join(
             "  "
-            + ", ".join(f"{field}={pair[field]!r}" for field in self.HASH_PAIR_FIELDS)
+            + ", ".join(
+                f"{field}={pair.get(field)!r}"
+                for field in self.HASH_PAIR_LOG_FIELDS
+            )
             for pair in hash_pairs
         )
         logging.warning(
@@ -645,14 +772,6 @@ class Filter:
             f"(input job {job_id}, tool jobs {tool_job_ids}, "
             f"{len(hash_pairs)} entries):\n{pairs}"
         )
-
-    async def _deanonymize_text(self, text: str) -> Dict[str, Any]:
-
-        body = {
-            "text": text,
-        }
-
-        return await self._anymize_api_request("POST", "/api/deanonymize", body)
 
     # file anonymization methods
     async def upload_file_from_path_for_ocr(self, file_path: str) -> Dict[str, Any]:
@@ -776,9 +895,9 @@ class Filter:
 
         result = await self._poll_status(job_id)
 
-        # Collects the mapping in __metadata__ for outlet() to log, and only
-        # when the valve store_hash_pairs is set. The masked text itself always
-        # comes from the API and does not depend on it.
+        # Collects the mapping in __metadata__ for the rest of the request, and
+        # only in mode "deanonymized". The masked text itself always comes from
+        # the API and does not depend on it.
         await self._store_hash_pairs(job_id, metadata, is_tool_result)
 
         logging.warning(
@@ -1046,6 +1165,135 @@ class Filter:
                 f"The result was withheld."
             )
 
+    def _log_missing_pairs(self, metadata: Optional[Dict[str, Any]]) -> None:
+        """Report once per request that no mapping is available.
+
+        Written from stream() and from outlet(), hence the shared one-time
+        guard: both fail the same way and for the same reason.
+        """
+
+        if isinstance(metadata, dict):
+            if metadata.get(self.METADATA_NO_PAIRS_LOGGED_KEY):
+                return
+            metadata[self.METADATA_NO_PAIRS_LOGGED_KEY] = True
+
+        logging.warning(
+            "Anonymize: no hash pairs available for this request — the "
+            "placeholders stay in the answer and in the tool call arguments "
+            "(the API returned no pairs, or the request for them failed)"
+        )
+
+    def _deanonymize_tool_calls(
+        self, event: dict, metadata: Optional[Dict[str, Any]]
+    ) -> dict:
+        """Replace the placeholders in the tool call arguments of one chunk.
+
+        The arguments of a tool call do not arrive at once: Open WebUI collects
+        the fragments of delta.tool_calls[].function.arguments by index and only
+        then runs the tool. A placeholder can therefore be split across two
+        chunks, which is what the buffer is for — see _split_pending(). Moving
+        text from one chunk into the next is safe exactly because Open WebUI
+        concatenates the fragments; only the sum has to be right.
+        """
+
+        if not isinstance(event, dict):
+            return event
+
+        choices = event.get("choices")
+        if not isinstance(choices, list):
+            return event
+
+        # The buffer belongs to the request, not to the instance: Open WebUI
+        # keeps one Filter for all users and chats, so instance state would mix
+        # up concurrent responses. Without metadata nothing can be carried to
+        # the next chunk, and nothing is then held back either.
+        can_buffer = isinstance(metadata, dict)
+        buffers = (
+            metadata.setdefault(self.METADATA_TOOL_CALL_BUFFER_KEY, {})
+            if can_buffer
+            else {}
+        )
+
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+
+            delta = choice.get("delta")
+            delta = delta if isinstance(delta, dict) else None
+            raw_entries = delta.get("tool_calls") if delta else None
+            entries = (
+                [entry for entry in raw_entries if isinstance(entry, dict)]
+                if isinstance(raw_entries, list)
+                else []
+            )
+
+            # A finish reason ends the tool call, so nothing may stay held after
+            # this chunk.
+            flush = not can_buffer or choice.get("finish_reason") is not None
+
+            if not entries and not (flush and buffers):
+                # The ordinary text chunk: nothing to do, and no mapping is
+                # built for it.
+                continue
+
+            mapping = _placeholder_map(metadata, for_json=True)
+            if not mapping:
+                # Holding fragments back would only delay them, so everything is
+                # emitted as it is and the placeholders reach the tool.
+                self._log_missing_pairs(metadata)
+                flush = True
+
+            replaced = []
+            names = []
+            for entry in entries:
+                function = entry.get("function")
+                if not isinstance(function, dict):
+                    continue
+
+                fragment = function.get("arguments")
+                if not isinstance(fragment, str):
+                    continue
+
+                index = entry.get("index", 0)
+                pending = buffers.pop(index, "") + fragment
+                pending, hit = _replace_placeholders(pending, mapping)
+                replaced.extend(hit)
+
+                if function.get("name"):
+                    names.append(str(function["name"]))
+
+                emit, hold = (pending, "") if flush else _split_pending(pending)
+                function["arguments"] = emit
+                if hold:
+                    buffers[index] = hold
+
+            if flush and buffers:
+                # A tail of an earlier chunk is still held while the stream ends
+                # here. It is appended as its own delta entry, which Open WebUI
+                # merges into the same tool call by index.
+                leftovers = [
+                    {"index": index, "function": {"arguments": buffers.pop(index)}}
+                    for index in sorted(buffers, key=str)
+                ]
+
+                if delta is None:
+                    delta = {}
+                    choice["delta"] = delta
+
+                existing = delta.get("tool_calls")
+                delta["tool_calls"] = (
+                    existing if isinstance(existing, list) else []
+                ) + leftovers
+
+            if replaced:
+                logging.warning(
+                    f"Anonymize tool_call: name={', '.join(names) or '?'} "
+                    f"placeholders replaced with their original values: "
+                    f"{', '.join(sorted(set(replaced)))}"
+                )
+
+        return event
+
     async def stream(
         self,
         event: dict,
@@ -1053,14 +1301,111 @@ class Filter:
         __metadata__: Optional[Dict[str, Any]] = None,
         __user__: Optional[Dict[str, Any]] = None,
     ) -> dict:
-        """Pass every chunk of a streamed response through untouched.
+        """De-anonymize the arguments of a streamed tool call, pass on the rest.
 
-        De-anonymization happens in outlet() on the finished message. Every
-        parameter but the event has a default because it is not guaranteed
-        which extras Open WebUI injects on the stream path.
+        The model only ever sees masked text, so it puts placeholders into the
+        arguments of a tool call as well — the tool would then be called with
+        `[[Person-HGCVVW]]` instead of the real value. This is the last point
+        before Open WebUI assembles the arguments and runs the tool.
+
+        The de-anonymization of the visible answer stays in outlet(); the chunks
+        of the answer text pass through here untouched.
+
+        Fails open: on any error the chunk is passed on unchanged. A placeholder
+        reaching the tool is a failed tool call, not a leak, while a raising
+        stream filter would break every response.
+
+        Every parameter but the event has a default because it is not
+        guaranteed which extras Open WebUI injects on the stream path.
         """
 
-        return event
+        if not self.toggle or not self._deanonymize:
+            return event
+
+        try:
+            return self._deanonymize_tool_calls(event, __metadata__)
+        except Exception as e:
+            logging.warning(
+                f"Anonymize tool_call de-anonymization failed: {e} — chunk passed "
+                f"on unchanged"
+            )
+            return event
+
+    @staticmethod
+    def _output_text_items(message: Dict[str, Any]):
+        """Yield the text items of the structured output blocks of a message.
+
+        From Open WebUI 0.10 on the frontend renders an assistant message from
+        message["output"] and falls back to message["content"] only when there
+        are none (ContentRenderer.svelte: `{#if output?.length}`). A streamed
+        answer always carries those blocks, so writing content alone leaves the
+        placeholders on screen and only fixes the stored message. The backend
+        compares and persists content and output separately, so both are
+        written. Adapted from the proof of concept in hook_logger.py.
+
+        Every layer is checked before it is entered: this structure comes from
+        the frontend and changes between Open WebUI versions.
+        """
+
+        output = message.get("output")
+        if not isinstance(output, list):
+            return
+
+        for block in output:
+            if not isinstance(block, dict) or block.get("type") != "message":
+                continue
+
+            items = block.get("content")
+            if not isinstance(items, list):
+                continue
+
+            for item in items:
+                if (
+                    isinstance(item, dict)
+                    and item.get("type") == "output_text"
+                    and isinstance(item.get("text"), str)
+                ):
+                    yield item
+
+    def _deanonymize_message(
+        self, message: Dict[str, Any], mapping: List[Tuple[str, str]]
+    ) -> Tuple[List[str], str]:
+        """Replace the placeholders of one assistant message in place.
+
+        Every text item is replaced for itself, so the blocks keep their order
+        and their number — a tool or reasoning block between two message blocks
+        stays where the frontend put it.
+
+        Returns the placeholders that were hit and a note for the log line.
+        """
+
+        replaced = []
+
+        content = message.get("content")
+        if isinstance(content, str):
+            message["content"], hit = _replace_placeholders(content, mapping)
+            replaced.extend(hit)
+
+        items = 0
+        for item in self._output_text_items(message):
+            item["text"], hit = _replace_placeholders(item["text"], mapping)
+            replaced.extend(hit)
+            items += 1
+
+        return replaced, f"content + {items} output text item(s)"
+
+    def _prefix_assistant_text(self, message: Dict[str, Any], prefix: str) -> None:
+        """Put a prefix in front of the answer, in content and on screen.
+
+        Only in front of the first text item: the prefix is one message about
+        the whole answer, not one per block.
+        """
+
+        message["content"] = f"{prefix}{message.get('content') or ''}"
+
+        item = next(self._output_text_items(message), None)
+        if item is not None:
+            item["text"] = f"{prefix}{item['text']}"
 
     async def outlet(
         self,
@@ -1073,7 +1418,7 @@ class Filter:
             return body
 
         # Own try/except and placed before the de-anonymization: the table is
-        # logged even when POST /api/deanonymize fails, and a broken log line
+        # logged even when the replacement below fails, and a broken log line
         # never costs the response.
         try:
             self._log_hash_pairs(__metadata__)
@@ -1081,8 +1426,7 @@ class Filter:
             logging.warning(f"Anonymize hash pair logging failed: {e}")
 
         try:
-            assistant_message = get_last_assistant_message(body["messages"])
-            if self.valves.output_filter == "deanonymized":
+            if self._deanonymize:
                 await __event_emitter__(
                     {
                         "type": "status",
@@ -1094,12 +1438,26 @@ class Filter:
                     }
                 )
 
-                result = await self._deanonymize_text(assistant_message)
-                if result.get("text", "").strip():
-                    for message in reversed(body["messages"]):
-                        if message["role"] == "assistant":
-                            message["content"] = result["text"]
-                            break
+                # Replaced locally from the pairs of this request, without
+                # asking the backend: they hold every original value already,
+                # the answer stays in the house, and the mapping still works
+                # once the job itself is gone.
+                mapping = _placeholder_map(__metadata__)
+                if not mapping:
+                    self._log_missing_pairs(__metadata__)
+
+                for message in reversed(body["messages"]):
+                    if message.get("role") != "assistant":
+                        continue
+
+                    replaced, note = self._deanonymize_message(message, mapping)
+                    if replaced:
+                        logging.warning(
+                            f"Anonymize outlet: "
+                            f"{len(set(replaced))} placeholder(s) restored in the "
+                            f"answer ({note})"
+                        )
+                    break
 
                 await __event_emitter__(
                     {
@@ -1115,21 +1473,29 @@ class Filter:
             return body
 
         except Exception as e:
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": f"❌ De-anonymization failed: {str(e)}",
-                        "done": True,
-                        "hidden": False,
-                    },
-                }
-            )
+            # Own try/except: the emitter may well be what raised above, and a
+            # status that cannot be shown must not cost the answer as well.
+            try:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": f"❌ De-anonymization failed: {str(e)}",
+                            "done": True,
+                            "hidden": False,
+                        },
+                    }
+                )
+            except Exception as emitter_error:
+                logging.warning(f"Anonymize outlet status failed: {emitter_error}")
 
-            for message in reversed(body["messages"]):
-                if message["role"] == "assistant":
-                    message["content"] = (
-                        f"❌ De-anonymization failed: {str(e)}\n\nOriginal response: {message['content']}"
+            # .get(): a missing key may well be what raised above, and the
+            # error path must not raise a second time.
+            for message in reversed(body.get("messages", [])):
+                if message.get("role") == "assistant":
+                    self._prefix_assistant_text(
+                        message,
+                        f"❌ De-anonymization failed: {str(e)}\n\nOriginal response: ",
                     )
                     break
 
