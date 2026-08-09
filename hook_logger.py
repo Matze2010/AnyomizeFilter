@@ -1,13 +1,14 @@
 """
 title: hook_logger
 author: Mathias Gisch
-version: 0.4.0
-description: Loggt jeden Aufruf von inlet(), stream(), outlet() und jedes Tool-Ergebnis, ohne etwas zu verändern. Optional (Valve outlet_overwrite, aus): ersetzt in outlet() die fertige Antwort komplett — Proof of Concept.
+version: 0.6.0
+description: Loggt jeden Aufruf von inlet(), stream(), outlet(), process_tool_result() und jedes Tool-Ergebnis, ohne etwas zu verändern. Optional (Valve outlet_overwrite, aus): ersetzt in outlet() die fertige Antwort komplett — Proof of Concept.
 """
 
 import functools
 import inspect
 import logging
+import time
 import weakref
 from pydantic import BaseModel, Field
 from typing import Any, Dict, Optional
@@ -21,7 +22,7 @@ from typing import Any, Dict, Optional
 # the model again without re-entering the filter chain; on the legacy path the
 # result is injected as context after inlet() already ran.
 #
-# Two functions are patched, because neither covers all tools on its own:
+# Three functions are patched, because none of them covers all tools on its own:
 #
 #   get_updated_tool_function(function, extra_params)
 #       Called by middleware right before a tool runs on the native function
@@ -39,9 +40,21 @@ from typing import Any, Dict, Optional
 #       get_updated_tool_function first, so they have to be wrapped here. This
 #       is also where tool names are learned for the log lines.
 #
-# Not covered: tools of direct tool servers (entries with direct=True). Open
-# WebUI executes them in the browser through an event, so nothing runs
-# server-side that could be wrapped.
+#   process_tool_result(request, tool_function_name, tool_result, tool_type,
+#                       direct_tool=False, metadata=None, user=None)
+#           -> (tool_result, tool_result_files, tool_result_embeds)
+#       The step after the call: middleware normalizes every result here (dict,
+#       list, tuple, HTMLResponse and MCP items all become a string) before it
+#       is appended as a role="tool" message. It is defined at module level in
+#       middleware and called through the module global, so replacing it covers
+#       every call site — including the direct tools the two wrappers above
+#       never see. This is also where anonymize.py hooks in, which makes the
+#       line logged here the reference when debugging that filter.
+#
+# Not covered by the two wrappers: tools of direct tool servers (entries with
+# direct=True). Open WebUI executes them in the browser through an event, so
+# nothing runs server-side that could be wrapped — their result does pass
+# process_tool_result() though.
 #
 # PROTOTYPE. This is a monkey patch of Open WebUI internals and can break on
 # any upgrade. It observes only; tool arguments, results and exceptions are
@@ -50,7 +63,7 @@ from typing import Any, Dict, Optional
 
 # Logged when the patches are installed. Open WebUI shows no version anywhere,
 # so this is the only way to tell from a log which source is actually running.
-_VERSION = "0.4.0"
+_VERSION = "0.6.0"
 
 # Marks a function this module has already wrapped, so that reloading the
 # filter in Open WebUI does not stack wrapper upon wrapper.
@@ -74,16 +87,95 @@ _TOOL_CALLABLE_KEYS = ("callable", "tool")
 # the map must not keep tool modules alive across reloads.
 _tool_names: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 
-# The Filter instance whose valves the tool wrappers read. Open WebUI keeps one
-# instance per function, and the wrappers live outside the class, so the
-# instance registers itself here in __init__.
+# The Filter instance whose valves the tool wrappers fall back to. Open WebUI
+# keeps one instance per function, and the wrappers live outside the class, so
+# the instance registers itself here in __init__.
 _active_filter = None
+
+# The function ID this module was imported under, needed to read the valves as
+# they are stored right now — see _stored_valves().
+#
+# Open WebUI loads every function module as f"function_{function_id}"
+# (utils/plugin.py), so the module name is the only place the ID the user chose
+# on import can be read from. Outside Open WebUI — tests, a direct import — the
+# name does not match and the ID stays None.
+_OWN_FUNCTION_ID = (
+    __name__[len("function_"):] if __name__.startswith("function_") else None
+)
+
+# The stored valves are read per tool call, not per log field. One second is
+# short enough that a valve flipped in the UI takes effect on the next call and
+# long enough that a single log line does not query the database seven times.
+_VALVE_CACHE_TTL = 1.0
+_valve_cache: Dict[str, Any] = {"read_at": 0.0, "values": None}
+
+# The store is read on every tool call; a failure would otherwise fill the log
+# with the same line over and over.
+_valve_store_warned = False
+
+
+def _stored_valves() -> Optional[Dict[str, Any]]:
+    """The valve values as they are stored right now, or None.
+
+    Reading _active_filter.valves alone is not enough. The wrappers hang on
+    middleware and run for every tool call of the instance, while the Filter
+    object they would read belongs to the module Open WebUI loaded last — and
+    that reload only happens lazily, when a request actually runs the filter.
+    Editing a valve while the filter is toggled off in the chat therefore has
+    no effect on the wrappers at all: they keep reading the valves the previous
+    module was built with. The stored values are the ones the UI writes, so
+    they are asked first and the instance is only the fallback.
+    """
+
+    global _valve_store_warned
+
+    if _OWN_FUNCTION_ID is None:
+        # Not loaded as an Open WebUI function — nothing to read from.
+        return None
+
+    now = time.monotonic()
+    if (
+        _valve_cache["values"] is not None
+        and now - _valve_cache["read_at"] < _VALVE_CACHE_TTL
+    ):
+        return _valve_cache["values"]
+
+    try:
+        from open_webui.models.functions import Functions
+
+        values = Functions.get_function_valves_by_id(_OWN_FUNCTION_ID)
+    except Exception as e:
+        if not _valve_store_warned:
+            _valve_store_warned = True
+            logging.warning(
+                f"hook_logger: cannot read the stored valves ({e}) — the tool "
+                f"wrappers fall back to the loaded instance, so a valve change "
+                f"only takes effect once the filter module is reloaded"
+            )
+        return None
+
+    if not isinstance(values, dict):
+        return None
+
+    _valve_cache["values"] = values
+    _valve_cache["read_at"] = now
+    return values
+
+
+def _valve_enabled(name: str) -> bool:
+    """True when that valve is on, read from the store where possible."""
+
+    stored = _stored_valves()
+    if stored is not None and name in stored:
+        return bool(stored[name])
+
+    return bool(
+        _active_filter is not None and getattr(_active_filter.valves, name, False)
+    )
 
 
 def _tool_logging_enabled() -> bool:
-    return bool(
-        _active_filter is not None and _active_filter.valves.log_tools
-    )
+    return _valve_enabled("log_tools")
 
 
 def _log_tool(line: str) -> None:
@@ -101,6 +193,95 @@ def _describe_result(result: Any) -> str:
         return f"type={type(result).__name__}{size}"
     except Exception:
         return f"type={type(result).__name__}"
+
+
+def _bind_call(original, args, kwargs) -> Dict[str, Any]:
+    """Resolve the arguments of a call by name, against the signature.
+
+    Middleware calls positionally, but binding against the signature of the
+    original keeps this working if Open WebUI reorders or adds parameters —
+    and a new parameter then shows up in the log on its own.
+    """
+
+    try:
+        bound = inspect.signature(original).bind(*args, **kwargs)
+        bound.apply_defaults()
+        return dict(bound.arguments)
+    except Exception as e:
+        _log_tool(f"could not read the call arguments: {e}")
+        return {}
+
+
+def _describe_argument(name: str, value: Any) -> str:
+    """One `name=value` pair for a call log line, kept compact.
+
+    The full payload of the parameters that can carry user data — the tool
+    result and the metadata — is only written when the valve log_payload is on.
+    """
+
+    payload = _valve_enabled("log_payload")
+
+    if name == "tool_result" and not payload:
+        # The whole point of the compact mode: type and size only, however
+        # short the result is.
+        size = f" len={len(value)}" if hasattr(value, "__len__") else ""
+        return f"{name}=<{type(value).__name__}{size}>"
+
+    if isinstance(value, (str, bool, int, float)) or value is None:
+        if isinstance(value, str) and not payload and len(value) > 200:
+            return f"{name}=<str len={len(value)}>"
+        return f"{name}={value!r}"
+
+    if isinstance(value, dict):
+        if payload:
+            return f"{name}={value!r}"
+        # Enough to correlate a call with the inlet/stream/outlet lines of the
+        # same request without writing the whole dict into the log.
+        known = {
+            key: value.get(key)
+            for key in ("chat_id", "message_id", "session_id", "user_id", "id")
+            if key in value
+        }
+        return f"{name}={{{', '.join(f'{k}={v!r}' for k, v in known.items())}}} keys={len(value)}"
+
+    if payload:
+        return f"{name}={value!r}"
+
+    size = f" len={len(value)}" if hasattr(value, "__len__") else ""
+    return f"{name}=<{type(value).__name__}{size}>"
+
+
+def _log_process_tool_result_call(arguments: Dict[str, Any]) -> None:
+    """Log one call of process_tool_result() with all of its parameters."""
+
+    try:
+        fields = " ".join(
+            _describe_argument(name, value) for name, value in arguments.items()
+        )
+    except Exception as e:
+        fields = f"<could not describe the arguments: {e}>"
+
+    _log_tool(f"process_tool_result: {fields}")
+
+
+def _log_process_tool_result_return(result: Any) -> None:
+    """Log what process_tool_result() returned.
+
+    The tuple is deliberately not unpacked: this module only observes, and
+    unpacking would break the moment Open WebUI changes what it returns.
+    """
+
+    try:
+        if _valve_enabled("log_payload"):
+            described = repr(result)
+        elif isinstance(result, (tuple, list)):
+            described = " | ".join(_describe_result(item) for item in result)
+        else:
+            described = _describe_result(result)
+    except Exception as e:
+        described = f"<could not describe the result: {e}>"
+
+    _log_tool(f"process_tool_result -> {described}")
 
 
 def _unwrap(fn):
@@ -158,7 +339,7 @@ def _wrap_tool_callable(name: str, fn):
     def _before(kwargs: Dict[str, Any]) -> None:
         if not _tool_logging_enabled():
             return
-        if _active_filter.valves.log_payload:
+        if _valve_enabled("log_payload"):
             _log_tool(f"tool_call: name={name} args={kwargs!r}")
         else:
             _log_tool(f"tool_call: name={name} args={sorted(kwargs)}")
@@ -166,7 +347,7 @@ def _wrap_tool_callable(name: str, fn):
     def _after(result: Any) -> None:
         if not _tool_logging_enabled():
             return
-        if _active_filter.valves.log_payload:
+        if _valve_enabled("log_payload"):
             _log_tool(f"tool_result: name={name} result={result!r}")
         else:
             _log_tool(f"tool_result: name={name} {_describe_result(result)}")
@@ -311,24 +492,95 @@ def _install_get_updated_tool_function_patch() -> bool:
     return patched_any
 
 
+def _install_process_tool_result_patch() -> bool:
+    """Log every call of middleware.process_tool_result(). Idempotent.
+
+    Pure observation: the arguments are logged before the original runs and its
+    return value is passed back untouched.
+    """
+
+    try:
+        from open_webui.utils import middleware
+    except Exception as e:
+        logging.warning(f"hook_logger: no tool result interception ({e})")
+        return False
+
+    installed = getattr(middleware, "process_tool_result", None)
+    if installed is None:
+        logging.warning(
+            "hook_logger: middleware.process_tool_result not found, no interception"
+        )
+        return False
+
+    # Rebuild from the untouched function, so a patch of an earlier module
+    # object is replaced instead of wrapped a second time.
+    original = _unwrap(installed)
+
+    @functools.wraps(original)
+    async def patched(*args, **kwargs):
+        enabled = _valve_enabled("log_process_tool_result")
+
+        # Logged before the original runs, so a call that hangs downstream is
+        # still visible in the log.
+        if enabled:
+            _log_process_tool_result_call(_bind_call(original, args, kwargs))
+
+        result = await original(*args, **kwargs)
+
+        if enabled:
+            _log_process_tool_result_return(result)
+
+        return result
+
+    setattr(patched, _PATCH_FLAG, True)
+    setattr(patched, _PATCH_ORIGINAL, original)
+    middleware.process_tool_result = patched
+
+    if installed is not original:
+        logging.warning(
+            "hook_logger: replaced the process_tool_result patch of an older version"
+        )
+
+    return True
+
+
 def _install_tool_patches() -> None:
-    """Install both patches and report in the log what is covered."""
+    """Install all three patches and report in the log what is covered."""
 
     try:
         via_get_tools = _install_get_tools_patch()
         via_updated = _install_get_updated_tool_function_patch()
+        via_result = _install_process_tool_result_patch()
     except Exception as e:
         logging.warning(f"hook_logger: tool interception failed ({e})")
         return
 
     logging.warning(
         f"hook_logger {_VERSION}: tool interception installed "
-        f"(get_tools={via_get_tools}, get_updated_tool_function={via_updated})"
+        f"(get_tools={via_get_tools}, get_updated_tool_function={via_updated}, "
+        f"process_tool_result={via_result})"
     )
+    if _OWN_FUNCTION_ID is None:
+        logging.warning(
+            "hook_logger: own function id unknown — the tool wrappers read the "
+            "valves of the loaded instance, so a valve change only takes effect "
+            "once the filter module is reloaded"
+        )
+    else:
+        logging.warning(
+            f"hook_logger: valves of the tool wrappers read live from function "
+            f"id {_OWN_FUNCTION_ID!r} (log_payload="
+            f"{_valve_enabled('log_payload')})"
+        )
     if not via_updated:
         logging.warning(
             "hook_logger: get_updated_tool_function not found — native function "
             "calling and MCP tools will not be logged on this Open WebUI version"
+        )
+    if not via_result:
+        logging.warning(
+            "hook_logger: process_tool_result not found — the normalization step "
+            "of tool results will not be logged on this Open WebUI version"
         )
 
 
@@ -359,13 +611,25 @@ class Filter:
             ),
         )
 
+        log_process_tool_result: bool = Field(
+            default=True,
+            description=(
+                "Log every call of middleware.process_tool_result() with all of "
+                "its parameters and describe what it returns. This is the step "
+                "where Open WebUI normalizes a tool result before it goes to the "
+                "model, and the only one that also covers direct tools. Needs the "
+                "monkey patch installed when this filter loads."
+            ),
+        )
+
         log_payload: bool = Field(
             default=False,
             description=(
-                "Log the full body/event of each hook call and the arguments and "
-                "results of each tool call. WARNING: writes user messages in clear "
-                "text into the server log. Off means one compact line per call "
-                "with metadata only."
+                "Log the full body/event of each hook call, the arguments and "
+                "results of each tool call, and the parameters and return value of "
+                "each process_tool_result() call. WARNING: writes user messages and "
+                "raw tool results in clear text into the server log. Off means one "
+                "compact line per call with metadata only."
             ),
         )
 
