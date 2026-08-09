@@ -79,7 +79,7 @@ sequenceDiagram
 2. Inhalt von [`anonymize.py`](anonymize.py) einfügen und speichern. Titel, Autor und Version zieht Open WebUI aus dem Docstring am Dateianfang.
 3. Function aktivieren und entweder global oder pro Modell zuweisen.
 4. Unter **Valves** den API-Key hinterlegen (siehe unten).
-5. Im Chat lässt sich der Filter über sein Icon ein- und ausschalten (`self.toggle = True`). Ist er aus, geben `inlet()` und `outlet()` den `body` unverändert zurück.
+5. Im Chat lässt sich der Filter über sein Icon ein- und ausschalten (`self.toggle = True`). Ist er aus, ruft Open WebUI `inlet()`, `stream()` und `outlet()` gar nicht erst auf — `self.toggle` bleibt dabei unverändert `True`, den Zustand des Schalters trägt allein `metadata["filter_ids"]`. Weil Tool-Ergebnisse nicht über die Filter-Pipeline laufen, sondern über den Monkey-Patch, prüft `_filter_enabled()` diese Liste dort ein zweites Mal; ist der Schalter aus, geht das Tool-Ergebnis unverändert an das Modell. Lässt sich der Zustand nicht ermitteln (fehlende Metadaten, ältere Open-WebUI-Version), wird sicherheitshalber anonymisiert.
 
 ---
 
@@ -145,7 +145,7 @@ Alles in `class Filter` in [`anonymize.py`](anonymize.py):
 | Datei-Handling | `get_file_paths()`, `process_multiple_files_for_ocr()` — Upload und Polling parallel via `asyncio.gather()` |
 | Orchestrierung | `_anonymize_content()` — ein Text von der Abgabe bis zum maskierten Ergebnis (Job, Polling, Zuordnungstabelle); genutzt von `process_input()` und `tool()`. `process_input()` — sammelt Inhalte, ruft die Anonymisierung, überschreibt die letzte User-Message |
 | Open-WebUI-Hooks | `inlet()` (vor dem LLM), `stream()` (je Chunk, reiner Durchreicher), `outlet()` (nach dem LLM) — alle mit `__metadata__` |
-| Tool-Ergebnisse | Modul-Ebene: `_unwrap()`, `_bind_tool_call()`, `_anonymize_tool_result()`, `_install_process_tool_result_patch()` — Monkey Patch; `_parse_tool_patterns()`, `_tool_excluded()` — Auswertung der Valve `tool_filter_exclude`. In der Klasse: `tool()` — siehe [Tool-Ergebnisse](#tool-ergebnisse) |
+| Tool-Ergebnisse | Modul-Ebene: `_unwrap()`, `_bind_tool_call()`, `_anonymize_tool_result()`, `_install_process_tool_result_patch()` — Monkey Patch; `_filter_enabled()` — Zustand des Chat-Schalters aus `metadata["filter_ids"]`; `_parse_tool_patterns()`, `_tool_excluded()` — Auswertung der Valve `tool_filter_exclude`. In der Klasse: `tool()` — siehe [Tool-Ergebnisse](#tool-ergebnisse) |
 
 ### Hash-Paare in `__metadata__`
 
@@ -209,6 +209,14 @@ Die Funktion ist in `middleware` modulglobal definiert und wird über den Modul-
 **Fehler laufen fail closed**: schlägt die Anonymisierung fehl (Backend nicht erreichbar, Timeout), ersetzt `tool()` das Ergebnis durch `❌ Anonymization of the result of <tool> failed: … The result was withheld.` Das rohe Ergebnis erreicht das Modell nie; der Chat läuft weiter, das Modell sieht einen fehlgeschlagenen Tool-Call. Dasselbe gilt, wenn der Wrapper selbst scheitert.
 
 Die Platzhalter aus Tool-Ergebnissen löst `outlet()` mit auf: `POST /api/deanonymize` arbeitet unabhängig vom Job.
+
+#### Chat-Schalter
+
+Derselbe Umweg, der die Tool-Ergebnisse überhaupt erreichbar macht, schneidet sie auch vom Ein-/Aus-Schalter im Chat ab: Der Monkey Patch hängt an `middleware` und läuft für **jeden** Tool-Call der Instanz, unabhängig davon, welche Filter die Anfrage aktiviert hat. `self.toggle` hilft dabei nicht — Open WebUI liest das Attribut einmal beim Aufbau der Filter-Kette und schreibt es nie zurück, es bleibt also immer `True`. Der Zustand des Schalters steckt allein in der Liste `metadata["filter_ids"]`, die der Client mitschickt (`main.py`: `"filter_ids": form_data.pop("filter_ids", [])`) und die auch `process_tool_result()` erhält.
+
+`_filter_enabled()` wertet sie in `tool()` als Erstes aus, vor Valves, Ausschlussliste und Event-Emitter, und wendet damit dieselbe Regel an, mit der Open WebUI über `inlet()`/`outlet()` entscheidet. Die eigene Function-ID liest das Modul aus seinem eigenen `__name__`, das Open WebUI beim Laden als `function_<id>` setzt. Ist der Schalter aus, geht das Tool-Ergebnis unverändert an das Modell — kein Job, keine Statusanzeige, eine Zeile im Log.
+
+Die Prüfung **fällt sicherheitshalber auf „an" zurück**: Lässt sich die eigene ID nicht bestimmen, fehlen die Metadaten oder kennt die Open-WebUI-Version den Key `filter_ids` nicht, wird anonymisiert. Ein Tool-Ergebnis bei ausgeschaltetem Filter zu maskieren ist lästig, PII im Klartext ans Modell zu geben nicht.
 
 #### Ausgeschlossene Tools
 
