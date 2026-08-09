@@ -2,7 +2,7 @@
 title: anonymize.py
 description: "Filter for anonymizing and deanonymizing text and files using an external API. The filter can be toggled on/off and configured via valves."
 author: Mathias Gisch
-version: 1.4.0
+version: 1.5.0
 """
 
 import asyncio
@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 # Logged when the patch is installed. Open WebUI shows no version anywhere, so
 # this is the only way to tell from a log which source is actually running.
-_VERSION = "1.4.0"
+_VERSION = "1.5.0"
 
 # Marks a function this module has already wrapped, so that reloading the
 # filter in Open WebUI does not stack wrapper upon wrapper.
@@ -67,6 +67,17 @@ _PATCH_ORIGINAL = "_anymize_tool_original"
 # instance per function, and the wrapper lives outside the class, so the
 # instance registers itself here in __init__.
 _active_filter = None
+
+# The function ID this module was imported under, needed to recognize its own
+# entry in metadata["filter_ids"] — see _filter_enabled().
+#
+# Open WebUI loads every function module as f"function_{function_id}"
+# (utils/plugin.py), so the module name is the only place the ID the user chose
+# on import can be read from. Outside Open WebUI — tests, a direct import — the
+# name does not match and the ID stays None.
+_OWN_FUNCTION_ID = (
+    __name__[len("function_"):] if __name__.startswith("function_") else None
+)
 
 
 def _unwrap(fn):
@@ -230,6 +241,40 @@ def _tool_excluded(tool_name: str, raw: Optional[str]) -> bool:
     except Exception as e:
         logging.warning(f"Anymize tool_filter_exclude could not be evaluated: {e}")
         return False
+
+
+def _filter_enabled(metadata: Optional[Dict[str, Any]]) -> bool:
+    """True unless this filter is provably switched off for this request.
+
+    self.toggle only *declares* the filter toggleable; Open WebUI reads it once
+    and never writes it back, so the instance attribute cannot tell the state.
+    The switch in the chat instead controls which function IDs the frontend
+    sends along, and those arrive as metadata["filter_ids"]. Open WebUI applies
+    the same rule to decide whether inlet()/outlet() run at all:
+
+        if getattr(function_module, "toggle", None):
+            return filter_id in (enabled_filter_ids or set())
+
+    The tool result never passes through that pipeline — it reaches this module
+    through the monkey patch, which is global and knows nothing about the
+    request — so the rule has to be applied here a second time.
+
+    Fails closed: an unknown own ID, missing metadata, an Open WebUI version
+    without the key or a broken evaluation all count as "on". Anonymizing while
+    switched off is a nuisance; handing PII to the model in clear text is not.
+    """
+
+    if _OWN_FUNCTION_ID is None:
+        return True
+
+    try:
+        if not isinstance(metadata, dict) or "filter_ids" not in metadata:
+            return True
+
+        return _OWN_FUNCTION_ID in (metadata.get("filter_ids") or [])
+    except Exception as e:
+        logging.warning(f"Anymize could not read the toggle state: {e}")
+        return True
 
 
 async def _anonymize_tool_result(tool_result, arguments: Dict[str, Any]):
@@ -436,6 +481,11 @@ class Filter:
     def __init__(self):
         global _active_filter
 
+        # Declares the filter switchable in the chat. Open WebUI reads the
+        # attribute once when it builds the filter pipeline and never writes it
+        # back, so it stays True even while the filter is switched off — the
+        # state of the switch is only readable from metadata["filter_ids"], see
+        # _filter_enabled().
         self.toggle = True
         self.valves = self.Valves()
 
@@ -891,6 +941,17 @@ class Filter:
         an error message instead of being handed to the model in clear text —
         the model then sees a failed tool call and the chat keeps running.
         """
+
+        # Checked first, before any valve: the switch in the chat has to reach
+        # this path too, and it is not visible in self.toggle — see
+        # _filter_enabled(). Placed before the emitter, so a switched-off filter
+        # shows no status in the chat and makes no backend call.
+        if not _filter_enabled(__metadata__):
+            logging.warning(
+                f"Anonymize tool_result skipped: name={__tool_name__} — filter "
+                f"switched off for this request, handed to the model unchanged"
+            )
+            return tool_result
 
         if not self.toggle or not self.valves.tool_filter:
             return tool_result
