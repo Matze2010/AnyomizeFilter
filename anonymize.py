@@ -2,7 +2,7 @@
 title: anonymize.py
 description: "Filter for anonymizing and deanonymizing text and files using an external API. The filter can be toggled on/off and configured via valves."
 author: Mathias Gisch
-version: 1.6.0
+version: 1.7.0
 """
 
 import asyncio
@@ -12,9 +12,13 @@ import functools
 import inspect
 import json
 import os
+import re
+import sys
+import types
 import logging
+from collections import OrderedDict
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, List, Any, Tuple
+from typing import Callable, Optional, Dict, List, Any, Tuple
 
 from open_webui.utils.misc import get_last_user_message
 from open_webui.config import UPLOAD_DIR
@@ -50,7 +54,7 @@ logger = logging.getLogger(__name__)
 
 # Logged when the patch is installed. Open WebUI shows no version anywhere, so
 # this is the only way to tell from a log which source is actually running.
-_VERSION = "1.6.0"
+_VERSION = "1.7.0"
 
 # Marks a function this module has already wrapped, so that reloading the
 # filter in Open WebUI does not stack wrapper upon wrapper.
@@ -87,6 +91,50 @@ _OWN_FUNCTION_ID = (
 _PLACEHOLDER_OPEN = "[["
 _PLACEHOLDER_CLOSE = "]]"
 _PLACEHOLDER_MAX_LEN = 64
+
+# One whole placeholder in a finished text. Used to keep the masking out of
+# placeholders that are already there — see _mask_text() — and to find the ones
+# nothing can resolve any more, see _orphan_placeholders().
+_PLACEHOLDER_RE = re.compile(
+    r"\[\[[^\[\]]{1,%d}\]\]" % _PLACEHOLDER_MAX_LEN
+)
+
+# An original shorter than this is never masked locally. The mapping is applied
+# as plain text replacement, and a two-letter original ("de", "AG") would hit
+# every other word of the conversation.
+_MIN_MASK_LEN = 3
+
+# Fallback cap on the number of chats kept in memory, used when the valve
+# cannot be read (no filter instance registered yet).
+_CHAT_PAIRS_MAX_CHATS = 200
+
+# --------------------------------------------------------------------------
+# Process-wide state
+#
+# Open WebUI re-execs the whole function module whenever its valves are edited
+# or its source is updated, so a plain module global would drop the mapping of
+# every open chat on each edit. The state therefore lives on a module of its
+# own that this file only ever looks up in sys.modules: the loader replaces
+# `function_anonymize`, never this one.
+#
+# It holds, per chat_id, the hash pairs collected in that chat:
+#
+#     {"pairs": [{original, hash, prefix_name, placeholder}, ...],
+#      "rebuilt": bool}
+#
+# "rebuilt" marks a chat whose mapping was already rebuilt from the history
+# once, so a conversation without any PII does not pay for that job per turn.
+#
+# The originals in there are PII, in clear text, in the memory of the Open WebUI
+# process. That is the price of holding the local context de-anonymized while
+# still masking it on the way out; it is bounded by the cap below and dies with
+# the process.
+# --------------------------------------------------------------------------
+_STATE = sys.modules.setdefault(
+    "_anymize_shared_state", types.ModuleType("_anymize_shared_state")
+)
+if not hasattr(_STATE, "chat_pairs"):
+    _STATE.chat_pairs = OrderedDict()
 
 
 def _unwrap(fn):
@@ -249,7 +297,13 @@ def _placeholder_map(
     if not isinstance(metadata, dict):
         return []
 
-    pairs = metadata.get(Filter.METADATA_HASH_PAIRS_KEY) or []
+    # The pairs of this request first, then everything else the chat has
+    # collected so far: the model may repeat a placeholder from an earlier turn,
+    # and its job is long gone by then. Same placeholder, same original — the
+    # order only decides who writes the entry.
+    pairs = (metadata.get(Filter.METADATA_HASH_PAIRS_KEY) or []) + _chat_pairs(
+        metadata.get("chat_id")
+    )
 
     mapping = {}
     for pair in pairs:
@@ -281,6 +335,291 @@ def _replace_placeholders(
             replaced.append(placeholder)
 
     return text, replaced
+
+
+def _chat_entry(chat_id: Optional[str], create: bool = False):
+    """The state of one chat, or None when there is no chat to key it on.
+
+    Without a chat_id — a temporary chat, or a direct call of
+    /api/chat/completions — nothing is kept: the mapping would have no owner and
+    would leak from one conversation into the next.
+    """
+
+    if not chat_id:
+        return None
+
+    store = _STATE.chat_pairs
+    entry = store.get(chat_id)
+
+    if entry is None:
+        if not create:
+            return None
+        entry = {"pairs": [], "rebuilt": False}
+        store[chat_id] = entry
+
+    store.move_to_end(chat_id)
+
+    max_chats = _CHAT_PAIRS_MAX_CHATS
+    try:
+        if _active_filter is not None:
+            max_chats = max(1, int(_active_filter.valves.chat_mapping_max_chats))
+    except Exception:
+        pass
+
+    while len(store) > max_chats:
+        dropped, _ = store.popitem(last=False)
+        logging.warning(
+            f"Anymize chat mapping: chat {dropped} dropped, more than "
+            f"{max_chats} chats in memory"
+        )
+
+    return entry
+
+
+def _chat_pairs(chat_id: Optional[str]) -> List[Dict[str, Any]]:
+    """The hash pairs collected in this chat so far. Never raises."""
+
+    try:
+        entry = _chat_entry(chat_id)
+        return list(entry["pairs"]) if entry else []
+    except Exception as e:
+        logging.warning(f"Anymize chat mapping unreadable: {e}")
+        return []
+
+
+def _remember_pairs(chat_id: Optional[str], pairs: List[Dict[str, Any]]) -> int:
+    """Add the pairs of one job to the chat. Returns how many were new.
+
+    Deduplicated over (original, placeholder): the same entity is masked again
+    in every job, and an alias — a second placeholder for a known original — is
+    kept on purpose, so the reverse direction can still resolve it if it ever
+    reaches the model.
+
+    Never raises: a mapping that cannot be kept costs the re-masking of the
+    history, not the request.
+    """
+
+    if not pairs:
+        return 0
+
+    try:
+        entry = _chat_entry(chat_id, create=True)
+        if entry is None:
+            return 0
+
+        known = {
+            (str(pair.get("original")), str(pair.get("placeholder")))
+            for pair in entry["pairs"]
+        }
+
+        added = 0
+        for pair in pairs:
+            if not isinstance(pair, dict):
+                continue
+
+            key = (str(pair.get("original")), str(pair.get("placeholder")))
+            if pair.get("placeholder") is None or pair.get("original") is None:
+                continue
+            if key in known:
+                continue
+
+            known.add(key)
+            entry["pairs"].append(pair)
+            added += 1
+
+        return added
+
+    except Exception as e:
+        logging.warning(f"Anymize chat mapping could not be updated: {e}")
+        return 0
+
+
+def _alias_placeholders(
+    chat_id: Optional[str], pairs: List[Dict[str, Any]]
+) -> List[Tuple[str, str]]:
+    """New placeholder -> the one this chat already uses for the same original.
+
+    Every job assigns its own placeholders, so the same person becomes
+    [[Person-HGCVVW]] in turn 1 and [[Person-QWERTZ]] in turn 3 — two entities
+    as far as the model is concerned. The canonical placeholder is the one
+    assigned first; the fresh text is rewritten onto it.
+
+    Must run before the new pairs are remembered, otherwise every placeholder is
+    its own alias.
+    """
+
+    canonical: Dict[str, str] = {}
+    for pair in _chat_pairs(chat_id):
+        original = pair.get("original")
+        placeholder = pair.get("placeholder")
+        if original is None or not placeholder:
+            continue
+        canonical.setdefault(str(original), str(placeholder))
+
+    if not canonical:
+        return []
+
+    aliases = {}
+    for pair in pairs:
+        if not isinstance(pair, dict):
+            continue
+
+        original = pair.get("original")
+        placeholder = pair.get("placeholder")
+        if original is None or not placeholder:
+            continue
+
+        known = canonical.get(str(original))
+        if known and known != str(placeholder):
+            aliases[str(placeholder)] = known
+
+    return sorted(aliases.items(), key=lambda item: len(item[0]), reverse=True)
+
+
+def _canonical_placeholders(
+    chat_id: Optional[str], extra_pairs: Optional[List[Dict[str, Any]]] = None
+) -> List[Tuple[str, str]]:
+    """Original -> placeholder for this chat, longest original first.
+
+    The direction the outgoing history is masked in. First entry wins, so an
+    alias never overwrites the canonical placeholder — and the pairs of the
+    chat come before extra_pairs, the ones of the running request.
+
+    Originals shorter than _MIN_MASK_LEN are left out, see there.
+
+    Longest first for the same reason as in _placeholder_map(): a shorter
+    original that is part of a longer one must not cut it in half.
+    """
+
+    mapping: Dict[str, str] = {}
+    for pair in _chat_pairs(chat_id) + list(extra_pairs or []):
+        if not isinstance(pair, dict):
+            continue
+        original = pair.get("original")
+        placeholder = pair.get("placeholder")
+        if original is None or not placeholder:
+            continue
+
+        original = str(original).strip()
+        if len(original) < _MIN_MASK_LEN:
+            continue
+
+        mapping.setdefault(original, str(placeholder))
+
+    return sorted(mapping.items(), key=lambda item: len(item[0]), reverse=True)
+
+
+def _mask_text(text: str, mask_map: List[Tuple[str, str]]) -> Tuple[str, List[str]]:
+    """Replace every known original in text with its placeholder.
+
+    Runs on the parts of the text between the placeholders that are already
+    there: an original such as "Person" would otherwise mask the inside of
+    [[Person-HGCVVW]]. Replacements go in as markers first and become
+    placeholders at the end, so a later, shorter original cannot match inside a
+    placeholder that has just been inserted.
+
+    Idempotent: what is masked no longer contains its original.
+    """
+
+    if not text or not mask_map:
+        return text, []
+
+    hits: List[str] = []
+    markers: List[str] = []
+
+    def mask_chunk(chunk: str) -> str:
+        for original, placeholder in mask_map:
+            if original not in chunk:
+                continue
+
+            marker = f"\x00{len(markers)}\x00"
+            markers.append(placeholder)
+            chunk = chunk.replace(original, marker)
+            hits.append(placeholder)
+
+        return chunk
+
+    parts = []
+    last = 0
+    for match in _PLACEHOLDER_RE.finditer(text):
+        parts.append(mask_chunk(text[last : match.start()]))
+        parts.append(match.group(0))
+        last = match.end()
+    parts.append(mask_chunk(text[last:]))
+
+    masked = "".join(parts)
+    for index, placeholder in enumerate(markers):
+        masked = masked.replace(f"\x00{index}\x00", placeholder)
+
+    return masked, hits
+
+
+def _apply_to_message_text(
+    message: Dict[str, Any], transform: Callable[[str], Tuple[str, List[str]]]
+) -> List[str]:
+    """Run transform over every piece of text of one message. Returns the hits.
+
+    Covers the three shapes a message text arrives in: "content" as a string,
+    "content" as a list of parts (multimodal messages), and the structured
+    output blocks the frontend renders from — the same ones outlet() writes to,
+    see Filter._output_text_items().
+    """
+
+    hits: List[str] = []
+
+    content = message.get("content")
+    if isinstance(content, str):
+        message["content"], hit = transform(content)
+        hits.extend(hit)
+    elif isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                part["text"], hit = transform(part["text"])
+                hits.extend(hit)
+
+    for item in Filter._output_text_items(message):
+        item["text"], hit = transform(item["text"])
+        hits.extend(hit)
+
+    return hits
+
+
+def _message_text(message: Dict[str, Any]) -> str:
+    """Everything of one message that is text, joined. Read only."""
+
+    texts = []
+
+    content = message.get("content")
+    if isinstance(content, str):
+        texts.append(content)
+    elif isinstance(content, list):
+        texts.extend(
+            part["text"]
+            for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        )
+
+    texts.extend(item["text"] for item in Filter._output_text_items(message))
+
+    return "\n\n".join(text for text in texts if text)
+
+
+def _orphan_placeholders(text: str, known: set) -> List[str]:
+    """Placeholders in text that no pair can resolve any more.
+
+    Happens when the mapping of a chat is gone — filter reload, restart, another
+    worker — while the conversation still carries its placeholders. Nothing can
+    be done about it at that point; it is worth a line in the log because the
+    user sees [[Person-HGCVVW]] in the answer and nothing else explains it.
+    """
+
+    return sorted(
+        {
+            match.group(0)
+            for match in _PLACEHOLDER_RE.finditer(text)
+            if match.group(0) not in known
+        }
+    )
 
 
 def _split_pending(text: str) -> Tuple[str, str]:
@@ -462,6 +801,11 @@ class Filter:
         "prefix_name",
     )
 
+    # Roles whose text is masked again before the conversation goes out. The
+    # system prompt is left alone: it comes from the configuration, not from the
+    # conversation, and this filter never put anything into it.
+    REMASK_ROLES = ("user", "assistant", "tool")
+
     # Keys used to hand the hash pairs from inlet() to outlet() via __metadata__
     METADATA_HASH_PAIRS_KEY = "_anymize_hash_pairs"
     METADATA_JOB_ID_KEY = "_anymize_job_id"
@@ -568,6 +912,41 @@ class Filter:
                 "'get_time, enaio_*'. Only effective while tool_filter is on. "
                 "WARNING: the result of an excluded tool reaches the model in "
                 "clear text. Empty means every tool result is anonymized."
+            ),
+        )
+
+        history_remasking: bool = Field(
+            default=True,
+            description=(
+                "Mask the whole conversation on the way out, not just the newest "
+                "user message. The local context is held de-anonymized, so every "
+                "older turn would otherwise reach the model in clear text. Uses "
+                "the mapping the chat has collected, without any further API "
+                "call; a chat whose mapping is missing is rebuilt with one job. "
+                "Off restores the old behaviour: only the last user message is "
+                "masked."
+            ),
+        )
+
+        chat_mapping_max_chats: int = Field(
+            default=200,
+            description=(
+                "How many chats keep their placeholder mapping in memory. The "
+                "least recently used chat is dropped first; its old placeholders "
+                "can then no longer be resolved and its clear text can no longer "
+                "be re-masked. The mapping holds the original values, so this is "
+                "also the cap on the PII kept in the process."
+            ),
+        )
+
+        persist_local_answer: bool = Field(
+            default=True,
+            description=(
+                "Write the de-anonymized answer back into the stored chat, so the "
+                "local context keeps the original values instead of the "
+                "placeholders of the stream. Needs open_webui.models.chats; if "
+                "Open WebUI persists the outlet result by itself, this can stay "
+                "off."
             ),
         )
 
@@ -701,21 +1080,32 @@ class Filter:
         job_id: str,
         metadata: Optional[Dict[str, Any]] = None,
         is_tool_result: bool = False,
-    ) -> List[Dict[str, Any]]:
+    ) -> Tuple[List[Dict[str, Any]], List[Tuple[str, str]]]:
+        """Fetch the mapping of one job, keep it, and report the aliases.
+
+        Returns the pairs of this job and the placeholders of this job that the
+        chat already knows under another name — the caller rewrites the masked
+        text onto those, see _alias_placeholders().
+        """
 
         if not self._deanonymize:
-            return []
+            return [], []
 
         try:
             response = await self._get_hash_pairs(job_id)
         except Exception as e:
             logging.warning(f"Anonymize hash pairs for job {job_id} unavailable: {e}")
-            return []
+            return [], []
 
         hash_pairs = [
             {field: pair.get(field) for field in self.HASH_PAIR_FIELDS}
             for pair in response.get("hash_pairs", [])
         ]
+
+        # Before the pairs are remembered, or every placeholder is its own alias.
+        chat_id = metadata.get("chat_id") if isinstance(metadata, dict) else None
+        aliases = _alias_placeholders(chat_id, hash_pairs)
+        _remember_pairs(chat_id, hash_pairs)
 
         if metadata is not None:
             # Append instead of assign: a request runs one anonymization for the
@@ -735,7 +1125,7 @@ class Filter:
         if not hash_pairs:
             logging.warning(f"Anonymize hash pairs for job {job_id}: none returned")
 
-        return hash_pairs
+        return hash_pairs, aliases
 
     def _log_hash_pairs(self, metadata: Optional[Dict[str, Any]]) -> None:
         """Log the mapping collected during this request, once, at the end.
@@ -895,17 +1285,167 @@ class Filter:
 
         result = await self._poll_status(job_id)
 
-        # Collects the mapping in __metadata__ for the rest of the request, and
-        # only in mode "deanonymized". The masked text itself always comes from
-        # the API and does not depend on it.
-        await self._store_hash_pairs(job_id, metadata, is_tool_result)
+        # Collects the mapping in __metadata__ and in the chat, and only in mode
+        # "deanonymized". The masked text itself always comes from the API and
+        # does not depend on it.
+        _, aliases = await self._store_hash_pairs(job_id, metadata, is_tool_result)
 
         logging.warning(
             f"Anonymize job {job_id}: using the anonymized text from the API"
         )
         final_content = result["anonymized_text_raw"]
 
+        # Onto the placeholders this chat already uses: the job knows nothing of
+        # the earlier turns and hands out its own names for entities that are
+        # long since masked in the history. Two names for one person is one
+        # person too many as far as the model is concerned.
+        if aliases:
+            final_content, replaced = _replace_placeholders(final_content, aliases)
+            if replaced:
+                logging.warning(
+                    f"Anonymize job {job_id}: {len(set(replaced))} placeholder(s) "
+                    f"mapped onto the ones this chat already uses"
+                )
+
         return final_content, result
+
+    async def _rebuild_chat_mapping(
+        self,
+        messages: List[Dict[str, Any]],
+        metadata: Optional[Dict[str, Any]],
+        chat_id: Optional[str],
+    ) -> None:
+        """Learn the mapping of a running conversation from its history.
+
+        The mapping lives in the memory of the process, so a filter reload, a
+        restart or a second worker leaves a chat that is full of original values
+        without one. The history is then sent through one job — not to use its
+        masked text, which is thrown away, but for the pairs it returns. The
+        masking itself stays local and per message afterwards, so no text has to
+        be split apart again.
+
+        Runs once per chat: a conversation that holds no PII at all returns no
+        pairs, and that must not buy a job per turn.
+
+        Does not catch: a failed rebuild means the history cannot be masked, and
+        inlet() turns that into a failed request rather than a clear text one.
+        """
+
+        entry = _chat_entry(chat_id)
+        if entry is not None and entry.get("rebuilt"):
+            return
+
+        text = "\n\n".join(
+            part for part in (_message_text(message) for message in messages) if part
+        )
+        if not text.strip():
+            return
+
+        logging.warning(
+            f"Anymize chat {chat_id}: no mapping for a conversation that is "
+            f"already running — rebuilding it from {len(messages)} message(s)"
+        )
+        await self._anonymize_content(
+            text, metadata, context=" (rebuilding the mapping of the chat)"
+        )
+
+        entry = _chat_entry(chat_id, create=True)
+        if entry is not None:
+            entry["rebuilt"] = True
+
+    async def _remask_history(
+        self,
+        body: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]] = None,
+        skip: Optional[Dict[str, Any]] = None,
+        had_mapping: bool = True,
+    ) -> None:
+        """Mask every message of the conversation but the one just masked.
+
+        outlet() puts the original values back and they stay in the local
+        context, which is the point — but that context is sent along with the
+        next question. Without this step every earlier turn would reach the
+        model in clear text, and only the newest message would be masked at all.
+
+        Works from the mapping of the chat, so it costs no API call and keeps
+        the placeholders of every turn identical. Both directions are covered
+        that way: a context that holds the original values is masked here, and
+        one that still holds placeholders is left as it is and resolved by
+        outlet() from the same mapping.
+        """
+
+        if not self.valves.history_remasking:
+            return
+
+        if not self._deanonymize:
+            # Mode "anonymized" never puts anything back, so the stored
+            # conversation still carries its placeholders — nothing to mask, and
+            # no mapping that could do it.
+            return
+
+        messages = body.get("messages") if isinstance(body, dict) else None
+        if not isinstance(messages, list):
+            return
+
+        targets = [
+            message
+            for message in messages
+            if isinstance(message, dict)
+            and message is not skip
+            and message.get("role") in self.REMASK_ROLES
+        ]
+        if not targets:
+            return
+
+        chat_id = metadata.get("chat_id") if isinstance(metadata, dict) else None
+        if not chat_id:
+            logging.warning(
+                "Anymize: no chat_id for this request — the history keeps "
+                "whatever it holds and is not masked again"
+            )
+            return
+
+        if not had_mapping:
+            await self._rebuild_chat_mapping(targets, metadata, chat_id)
+
+        # The pairs of this request as well: the chat mapping is the canonical
+        # one, but a job of this request may have seen an entity that is not in
+        # it yet.
+        request_pairs = (
+            metadata.get(self.METADATA_HASH_PAIRS_KEY) or []
+            if isinstance(metadata, dict)
+            else []
+        )
+        mask_map = _canonical_placeholders(chat_id, request_pairs)
+
+        masked = 0
+        hits: List[str] = []
+        if mask_map:
+            for message in targets:
+                hit = _apply_to_message_text(
+                    message, lambda text: _mask_text(text, mask_map)
+                )
+                if hit:
+                    masked += 1
+                    hits.extend(hit)
+
+            if hits:
+                logging.warning(
+                    f"Anonymize inlet: {len(set(hits))} value(s) masked again in "
+                    f"{masked} message(s) of the history"
+                )
+
+        # What no pair can resolve any more stays visible in the answer, so it
+        # is worth a line — this is what a lost mapping looks like from outside.
+        known = {placeholder for placeholder, _ in _placeholder_map(metadata)}
+        orphans = _orphan_placeholders(
+            "\n\n".join(_message_text(message) for message in targets), known
+        )
+        if orphans:
+            logging.warning(
+                f"Anonymize inlet: {len(orphans)} placeholder(s) in the history "
+                f"that no pair resolves any more: {', '.join(orphans[:10])}"
+            )
 
     async def process_input(
         self,
@@ -916,6 +1456,12 @@ class Filter:
     ):
         content_to_anonymize = ""
         system_prompt = ""
+
+        # Read before the first job of this request stores its pairs, otherwise
+        # the mapping of a chat that has just lost its own would look complete.
+        had_mapping = bool(
+            _chat_pairs(metadata.get("chat_id") if isinstance(metadata, dict) else None)
+        )
 
         # Collect content based on input_filter
         if input_filter in ["file_anonymization", "text_file_anonymization"]:
@@ -959,6 +1505,9 @@ class Filter:
                     content_to_anonymize = last_message
 
         if not content_to_anonymize:
+            # Nothing new to mask, but the history still has to be: the local
+            # context holds the original values, see _remask_history().
+            await self._remask_history(body, metadata, had_mapping=had_mapping)
             return body
 
         # Anonymize combined content if we have any
@@ -992,10 +1541,18 @@ class Filter:
                 final_content += f"\n\n{system_prompt}"
 
         # Update the last user message
+        masked_message = None
         for message in reversed(body["messages"]):
             if message["role"] == "user":
                 message["content"] = final_content
+                masked_message = message
                 break
+
+        # Everything before it: masked from the mapping of this chat, without
+        # another API call.
+        await self._remask_history(
+            body, metadata, skip=masked_message, had_mapping=had_mapping
+        )
 
         await event_emitter(
             {
@@ -1394,6 +1951,67 @@ class Filter:
 
         return replaced, f"content + {items} output text item(s)"
 
+    def _persist_message(
+        self, message: Dict[str, Any], metadata: Optional[Dict[str, Any]]
+    ) -> None:
+        """Write the de-anonymized answer into the stored chat.
+
+        What the answer was assembled from during the stream is the masked text,
+        and that is what the conversation is continued with — the placeholders
+        would be back in the context of the next question, with a mapping that
+        by then only this filter still has. The message is therefore written
+        once more, in the shape the user sees it in.
+
+        Everything is checked before it is used: this reaches into Open WebUI
+        internals, and a failed write must cost a log line, not the answer.
+        """
+
+        if not self.valves.persist_local_answer:
+            return
+
+        if not isinstance(metadata, dict):
+            return
+
+        chat_id = metadata.get("chat_id")
+        message_id = metadata.get("message_id") or message.get("id")
+        if not chat_id or not message_id:
+            logging.warning(
+                "Anonymize outlet: no chat_id/message_id — the de-anonymized "
+                "answer is only returned, not stored"
+            )
+            return
+
+        try:
+            from open_webui.models.chats import Chats
+
+            upsert = getattr(
+                Chats, "upsert_message_to_chat_by_id_and_message_id", None
+            )
+            if upsert is None:
+                logging.warning(
+                    "Anonymize outlet: this Open WebUI has no "
+                    "upsert_message_to_chat_by_id_and_message_id — the "
+                    "de-anonymized answer is not stored"
+                )
+                return
+
+            payload: Dict[str, Any] = {}
+            if isinstance(message.get("content"), str):
+                payload["content"] = message["content"]
+            if isinstance(message.get("output"), list):
+                payload["output"] = message["output"]
+
+            if not payload:
+                return
+
+            upsert(chat_id, message_id, payload)
+
+        except Exception as e:
+            logging.warning(
+                f"Anonymize outlet: the de-anonymized answer could not be "
+                f"stored ({e}) — it is only returned"
+            )
+
     def _prefix_assistant_text(self, message: Dict[str, Any], prefix: str) -> None:
         """Put a prefix in front of the answer, in content and on screen.
 
@@ -1457,6 +2075,10 @@ class Filter:
                             f"{len(set(replaced))} placeholder(s) restored in the "
                             f"answer ({note})"
                         )
+
+                    # Also into the stored chat, so the local context keeps the
+                    # original values. inlet() masks them again on the way out.
+                    self._persist_message(message, __metadata__)
                     break
 
                 await __event_emitter__(
