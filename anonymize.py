@@ -2,7 +2,7 @@
 title: anonymize.py
 description: "Filter for anonymizing and deanonymizing text and files using an external API. The filter can be toggled on/off and configured via valves."
 author: Mathias Gisch
-version: 1.7.0
+version: 1.8.0
 """
 
 import asyncio
@@ -48,13 +48,14 @@ logger = logging.getLogger(__name__)
 # sees text.
 #
 # PROTOTYPE. This is a monkey patch of Open WebUI internals and can break on
-# any upgrade. If process_tool_result is missing, the filter keeps working
-# without tool anonymization and says so in the log.
+# any upgrade. Open WebUI 0.11.1 is the minimum this filter is built for; if
+# process_tool_result is missing, the filter keeps working without tool
+# anonymization and says so in the log.
 # --------------------------------------------------------------------------
 
 # Logged when the patch is installed. Open WebUI shows no version anywhere, so
 # this is the only way to tell from a log which source is actually running.
-_VERSION = "1.7.0"
+_VERSION = "1.8.0"
 
 # Marks a function this module has already wrapped, so that reloading the
 # filter in Open WebUI does not stack wrapper upon wrapper.
@@ -153,11 +154,12 @@ def _unwrap(fn):
     return fn
 
 
-def _bind_tool_call(original, args, kwargs) -> Dict[str, Any]:
-    """Resolve the arguments of a process_tool_result() call by name.
+def _bind_call(original, args, kwargs) -> Dict[str, Any]:
+    """Resolve the arguments of a patched Open WebUI call by name.
 
-    Middleware calls positionally, but binding against the signature of the
-    original keeps this working if Open WebUI reorders or adds parameters.
+    Open WebUI calls positionally, but binding against the signature of the
+    original keeps this working if it reorders or adds parameters. Used by both
+    monkey patches of this module.
     """
 
     try:
@@ -165,7 +167,7 @@ def _bind_tool_call(original, args, kwargs) -> Dict[str, Any]:
         bound.apply_defaults()
         return dict(bound.arguments)
     except Exception as e:
-        logging.warning(f"Anymize could not read the tool call arguments: {e}")
+        logging.warning(f"Anymize could not read the call arguments: {e}")
         return {}
 
 
@@ -242,12 +244,7 @@ async def _event_emitter_for(metadata: Optional[Dict[str, Any]]):
     try:
         from open_webui.socket.main import get_event_emitter
 
-        emitter = get_event_emitter(metadata)
-        # async in current versions, plain function in older ones
-        if inspect.isawaitable(emitter):
-            emitter = await emitter
-
-        return emitter
+        return await get_event_emitter(metadata)
     except Exception as e:
         logging.warning(f"Anymize could not build an event emitter: {e}")
         return None
@@ -747,8 +744,9 @@ def _install_process_tool_result_patch() -> bool:
     installed = getattr(middleware, "process_tool_result", None)
     if installed is None:
         logging.warning(
-            "Anymize: middleware.process_tool_result not found — tool results are "
-            "NOT anonymized on this Open WebUI version"
+            "Anymize: middleware.process_tool_result not found — this Open "
+            "WebUI is not supported by this filter (0.11.1 or newer is "
+            "required); tool results are NOT anonymized"
         )
         return False
 
@@ -760,7 +758,7 @@ def _install_process_tool_result_patch() -> bool:
     async def patched(*args, **kwargs):
         # Logged before the original runs, so a call that hangs downstream is
         # still visible in the log.
-        arguments = _bind_tool_call(original, args, kwargs)
+        arguments = _bind_call(original, args, kwargs)
         _log_tool_call(arguments)
 
         tool_result, tool_result_files, tool_result_embeds = await original(
@@ -779,6 +777,86 @@ def _install_process_tool_result_patch() -> bool:
         )
 
     logging.warning(f"Anymize {_VERSION}: process_tool_result patch installed")
+    return True
+
+
+# --------------------------------------------------------------------------
+# Tool approval interception
+#
+# Open WebUI 0.11.1 can pause a response and wait for the user to approve a
+# tool call. On resume, main.process_chat() calls
+#
+#   drain_approved_tool_calls(request, form_data, user, model, metadata) -> bool
+#
+# AFTER process_chat_payload() — that is, after inlet() has already run — and
+# that function replaces form_data["messages"] wholesale with messages rebuilt
+# from the stored chat (utils/middleware.py, load_messages_from_db() plus
+# process_messages_with_output()). The stored chat holds clear text: Open WebUI
+# writes the de-anonymized outlet result back itself, and the user's own message
+# was never masked there. Everything inlet() masked is therefore discarded, no
+# filter hook runs afterwards, and the resumed request would reach the model in
+# clear text.
+#
+# The wrapper runs AFTER the original and masks the rebuilt conversation again
+# from the mapping of the chat.
+#
+# Unlike process_tool_result(), this one is patched on open_webui.main: main.py
+# binds the name at import time with `from open_webui.utils.middleware import
+# ... drain_approved_tool_calls`, so a patch on the middleware module would
+# never be reached.
+#
+# PROTOTYPE, same caveat as above: a monkey patch of Open WebUI internals.
+# --------------------------------------------------------------------------
+
+
+def _install_drain_approved_patch() -> bool:
+    """Patch main.drain_approved_tool_calls. Idempotent across reloads."""
+
+    try:
+        from open_webui import main as owui_main
+    except Exception as e:
+        logging.warning(f"Anymize: no tool approval interception ({e})")
+        return False
+
+    installed = getattr(owui_main, "drain_approved_tool_calls", None)
+    if installed is None:
+        logging.warning(
+            "Anymize: main.drain_approved_tool_calls not found — this Open WebUI "
+            "is older than 0.11.1 and not supported by this filter; a resumed "
+            "tool approval would reach the model in clear text"
+        )
+        return False
+
+    original = _unwrap(installed)
+
+    @functools.wraps(original)
+    async def patched(*args, **kwargs):
+        paused = await original(*args, **kwargs)
+
+        if _active_filter is not None:
+            arguments = _bind_call(original, args, kwargs)
+            # No try/except: the messages hold clear text at this point, so a
+            # broken masking has to end the request, not pass it on. main.py
+            # turns the exception into a chat error.
+            await _active_filter.remask_drained_messages(
+                arguments.get("form_data"), arguments.get("metadata")
+            )
+
+        return paused
+
+    setattr(patched, _PATCH_FLAG, True)
+    setattr(patched, _PATCH_ORIGINAL, original)
+    owui_main.drain_approved_tool_calls = patched
+
+    if installed is not original:
+        logging.warning(
+            "Anymize: replaced the drain_approved_tool_calls patch of an older "
+            "version"
+        )
+
+    logging.warning(
+        f"Anymize {_VERSION}: drain_approved_tool_calls patch installed"
+    )
     return True
 
 
@@ -939,17 +1017,6 @@ class Filter:
             ),
         )
 
-        persist_local_answer: bool = Field(
-            default=True,
-            description=(
-                "Write the de-anonymized answer back into the stored chat, so the "
-                "local context keeps the original values instead of the "
-                "placeholders of the stream. Needs open_webui.models.chats; if "
-                "Open WebUI persists the outlet result by itself, this can stay "
-                "off."
-            ),
-        )
-
         log_tool_payload: bool = Field(
             default=False,
             description=(
@@ -979,6 +1046,7 @@ class Filter:
         # from here.
         _active_filter = self
         _install_process_tool_result_patch()
+        _install_drain_approved_patch()
         self.icon = """data:image/svg+xml,%3C%3Fxml%20version%3D%221.0%22%20encoding%3D%22UTF-8%22%3F%3E%3Csvg%20id%3D%22Ebene_2%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2064%2050.57%22%3E%3Cg%20id%3D%22Ebene_1-2%22%3E%3Cpath%20d%3D%22M62.5%2C43.07c-.97-.62-1.94-1.41-1.94-3.01v-22.54c0-7.63-3.88-12.48-9.98-14.75v39.66s.06-.05.08-.08c.62%2C3.54%2C3.45%2C5.75%2C7.87%2C5.75%2C3.01%2C0%2C5.48-.97%2C5.48-2.83%2C0-1.06-.71-1.59-1.5-2.21Z%22%2F%3E%3Cpath%20d%3D%22M21.13%2C36.09c0-10.78%2C12.73-14.85%2C29.34-15.03v-5.39c0-7.34-4.15-10.78-10.08-10.78s-6.89%2C3.36-7.69%2C6.54c-.71%2C2.83-1.33%2C5.39-5.21%2C5.39-3.01%2C0-4.69-1.77-4.69-4.42%2C0-5.3%2C6.54-11.14%2C18.38-11.14%2C3.47%2C0%2C6.65.5%2C9.38%2C1.52V0H0v50.57h50.57v-8.14c-3.53%2C3.58-8.62%2C5.67-14.59%2C5.67-8.84%2C0-14.85-4.68-14.85-12.02Z%22%2F%3E%3Cpath%20d%3D%22M31.03%2C33.96c0%2C5.13%2C4.51%2C8.57%2C10.16%2C8.57%2C3.71%2C0%2C7.16-1.5%2C9.28-3.98v-12.46c-1.59-.8-3.45-1.06-5.75-1.06-8.04%2C0-13.7%2C3.27-13.7%2C8.93Z%22%2F%3E%3C%2Fg%3E%3C%2Fsvg%3E"""
         pass
 
@@ -1408,6 +1476,23 @@ class Filter:
         if not had_mapping:
             await self._rebuild_chat_mapping(targets, metadata, chat_id)
 
+        self._mask_messages(targets, metadata, chat_id, "inlet")
+
+    def _mask_messages(
+        self,
+        targets: List[Dict[str, Any]],
+        metadata: Optional[Dict[str, Any]],
+        chat_id: str,
+        where: str,
+    ) -> None:
+        """Mask every known original in targets, in place, from the chat mapping.
+
+        Shared by the two places that hold a conversation which may carry the
+        original values: inlet(), for the history sent along with the next
+        question, and the tool approval patch, for the conversation Open WebUI
+        rebuilds from the stored chat. `where` only names the caller in the log.
+        """
+
         # The pairs of this request as well: the chat mapping is the canonical
         # one, but a job of this request may have seen an entity that is not in
         # it yet.
@@ -1431,7 +1516,7 @@ class Filter:
 
             if hits:
                 logging.warning(
-                    f"Anonymize inlet: {len(set(hits))} value(s) masked again in "
+                    f"Anonymize {where}: {len(set(hits))} value(s) masked again in "
                     f"{masked} message(s) of the history"
                 )
 
@@ -1443,9 +1528,63 @@ class Filter:
         )
         if orphans:
             logging.warning(
-                f"Anonymize inlet: {len(orphans)} placeholder(s) in the history "
+                f"Anonymize {where}: {len(orphans)} placeholder(s) in the history "
                 f"that no pair resolves any more: {', '.join(orphans[:10])}"
             )
+
+    async def remask_drained_messages(
+        self,
+        form_data: Optional[Dict[str, Any]],
+        metadata: Optional[Dict[str, Any]],
+    ) -> None:
+        """Mask the conversation Open WebUI rebuilt from the stored chat.
+
+        Called from the drain_approved_tool_calls() patch. Everything inlet()
+        masked is gone at that point: the function replaces form_data["messages"]
+        wholesale with messages read from the database, and the database holds
+        the de-anonymized answer as well as the user's message in clear text.
+        No filter hook runs afterwards, so this is the last place to mask.
+
+        Same mapping and same idempotent replacement as _remask_history(), only
+        without an exception for the newest message — that one was replaced by
+        its stored version too.
+
+        Raises rather than swallows: the caller turns an exception into a failed
+        response, and a failed response is the right outcome when the request
+        would otherwise carry clear text to the model.
+        """
+
+        if not self.toggle or not _filter_enabled(metadata):
+            return
+
+        if not self.valves.history_remasking:
+            return
+
+        if not self._deanonymize:
+            # Mode "anonymized" never puts anything back, so the stored
+            # conversation still carries its placeholders.
+            return
+
+        messages = form_data.get("messages") if isinstance(form_data, dict) else None
+        if not isinstance(messages, list):
+            return
+
+        targets = [
+            message
+            for message in messages
+            if isinstance(message, dict) and message.get("role") in self.REMASK_ROLES
+        ]
+        if not targets:
+            return
+
+        chat_id = metadata.get("chat_id") if isinstance(metadata, dict) else None
+        if not chat_id:
+            raise RuntimeError(
+                "no chat_id for this request — the rebuilt conversation cannot "
+                "be masked"
+            )
+
+        self._mask_messages(targets, metadata, chat_id, "tool approval")
 
     async def process_input(
         self,
@@ -1892,10 +2031,10 @@ class Filter:
     def _output_text_items(message: Dict[str, Any]):
         """Yield the text items of the structured output blocks of a message.
 
-        From Open WebUI 0.10 on the frontend renders an assistant message from
-        message["output"] and falls back to message["content"] only when there
-        are none (ContentRenderer.svelte: `{#if output?.length}`). A streamed
-        answer always carries those blocks, so writing content alone leaves the
+        The frontend renders an assistant message from message["output"] and
+        falls back to message["content"] only when there are none
+        (ContentRenderer.svelte: `{#if output?.length}`). A streamed answer
+        always carries those blocks, so writing content alone leaves the
         placeholders on screen and only fixes the stored message. The backend
         compares and persists content and output separately, so both are
         written. Adapted from the proof of concept in hook_logger.py.
@@ -1933,6 +2072,14 @@ class Filter:
         and their number — a tool or reasoning block between two message blocks
         stays where the frontend put it.
 
+        content and the output blocks are both rewritten, and that is all this
+        filter has to do: Open WebUI compares the outlet result against the
+        stored message and writes back whatever changed — content, output and
+        the previous text as originalContent (utils/middleware.py,
+        outlet_filter_handler). The stored chat therefore holds the clear text
+        from here on, which is the point — inlet() masks it again for the next
+        turn, see _remask_history().
+
         Returns the placeholders that were hit and a note for the log line.
         """
 
@@ -1950,67 +2097,6 @@ class Filter:
             items += 1
 
         return replaced, f"content + {items} output text item(s)"
-
-    def _persist_message(
-        self, message: Dict[str, Any], metadata: Optional[Dict[str, Any]]
-    ) -> None:
-        """Write the de-anonymized answer into the stored chat.
-
-        What the answer was assembled from during the stream is the masked text,
-        and that is what the conversation is continued with — the placeholders
-        would be back in the context of the next question, with a mapping that
-        by then only this filter still has. The message is therefore written
-        once more, in the shape the user sees it in.
-
-        Everything is checked before it is used: this reaches into Open WebUI
-        internals, and a failed write must cost a log line, not the answer.
-        """
-
-        if not self.valves.persist_local_answer:
-            return
-
-        if not isinstance(metadata, dict):
-            return
-
-        chat_id = metadata.get("chat_id")
-        message_id = metadata.get("message_id") or message.get("id")
-        if not chat_id or not message_id:
-            logging.warning(
-                "Anonymize outlet: no chat_id/message_id — the de-anonymized "
-                "answer is only returned, not stored"
-            )
-            return
-
-        try:
-            from open_webui.models.chats import Chats
-
-            upsert = getattr(
-                Chats, "upsert_message_to_chat_by_id_and_message_id", None
-            )
-            if upsert is None:
-                logging.warning(
-                    "Anonymize outlet: this Open WebUI has no "
-                    "upsert_message_to_chat_by_id_and_message_id — the "
-                    "de-anonymized answer is not stored"
-                )
-                return
-
-            payload: Dict[str, Any] = {}
-            if isinstance(message.get("content"), str):
-                payload["content"] = message["content"]
-            if isinstance(message.get("output"), list):
-                payload["output"] = message["output"]
-
-            if not payload:
-                return
-
-            upsert(chat_id, message_id, payload)
-
-        except Exception as e:
-            logging.warning(
-                f"Anonymize outlet: the de-anonymized answer could not be "
-                f"stored ({e}) — it is only returned"
-            )
 
     def _prefix_assistant_text(self, message: Dict[str, Any], prefix: str) -> None:
         """Put a prefix in front of the answer, in content and on screen.
@@ -2076,9 +2162,6 @@ class Filter:
                             f"answer ({note})"
                         )
 
-                    # Also into the stored chat, so the local context keeps the
-                    # original values. inlet() masks them again on the way out.
-                    self._persist_message(message, __metadata__)
                     break
 
                 await __event_emitter__(
