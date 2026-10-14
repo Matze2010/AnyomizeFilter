@@ -4,9 +4,9 @@ Ein [Open WebUI](https://github.com/open-webui/open-webui)-Filter, der personenb
 
 Die Anonymisierung selbst passiert nicht lokal, sondern über die externe API. Der Filter ersetzt PII durch Platzhalter der Form `[[Typ-HASH]]` (z. B. `[[Person-QSEZB6]]`), schickt den maskierten Text ans Modell und macht die Maskierung nach der Antwort wieder rückgängig.
 
-**Lokal steht der Klartext, ausgehend die Platzhalter.** Die de-anonymisierte Antwort wird in den gespeicherten Chat zurückgeschrieben, und weil dieser Verlauf mit der nächsten Frage wieder mitgeschickt wird, maskiert `inlet()` die **gesamte** Unterhaltung erneut — lokal, aus der Zuordnungstabelle des Chats, ohne weiteren API-Call. Dieselbe Person behält dabei über alle Turns denselben Platzhalter. Siehe [Kontext über mehrere Turns](#kontext-über-mehrere-turns).
+**Lokal steht der Klartext, ausgehend die Platzhalter.** Die de-anonymisierte Antwort landet im gespeicherten Chat — Open WebUI schreibt das Ergebnis von `outlet()` selbst zurück —, und weil dieser Verlauf mit der nächsten Frage wieder mitgeschickt wird, maskiert `inlet()` die **gesamte** Unterhaltung erneut — lokal, aus der Zuordnungstabelle des Chats, ohne weiteren API-Call. Dieselbe Person behält dabei über alle Turns denselben Platzhalter. Siehe [Kontext über mehrere Turns](#kontext-über-mehrere-turns).
 
-Der gesamte Filter steckt in einer Datei: [`anonymize.py`](anonymize.py).
+Der gesamte Filter steckt in einer Datei: [`anonymize.py`](anonymize.py). Vorausgesetzt wird **Open WebUI 0.11.2 oder neuer** (geprüft gegen 0.11.4), siehe [Voraussetzungen](#voraussetzungen).
 
 ---
 
@@ -36,6 +36,9 @@ sequenceDiagram
     end
     F-->>OWUI: letzte User-Message ersetzt durch maskierten Text
     F->>F: restliche History aus dem Chat-Mapping maskieren
+    OWUI->>OWUI: RAG-/Wissens-/Web-Kontext als source-Block einfügen
+    OWUI->>F: request(body)
+    F-->>OWUI: gesamter Body nachmaskiert
     OWUI->>LLM: Prompt mit [[Typ-HASH]]-Platzhaltern
     opt Tool-Call
         LLM-->>OWUI: tool_call
@@ -44,6 +47,8 @@ sequenceDiagram
         F->>A: POST /api/anonymize + Polling
         A-->>F: anonymized_text_raw
         F-->>OWUI: maskiertes Tool-Ergebnis
+        OWUI->>F: request(body)
+        F-->>OWUI: Body nachmaskiert
         OWUI->>LLM: erneuter Aufruf mit role="tool"
     end
     LLM-->>OWUI: Antwort mit Platzhaltern
@@ -55,10 +60,18 @@ sequenceDiagram
     end
     OWUI->>F: outlet(body)
     opt output_filter = deanonymized
-        F->>F: Platzhalter aus den Hash-Paaren ersetzen
-        F->>OWUI: de-anonymisierte Antwort in den Chat schreiben
+        F->>F: Platzhalter aus den Hash-Paaren ersetzen (content + output)
+        F-->>OWUI: de-anonymisierte Antwort
+        OWUI->>OWUI: content + output in den gespeicherten Chat schreiben
     end
     F-->>U: Antwort mit echten Werten
+    opt Tool-Freigabe
+        U->>OWUI: Tool-Call freigeben
+        OWUI->>OWUI: drain_approved_tool_calls() — History aus dem Chat neu aufgebaut
+        OWUI->>F: request(body)
+        F-->>OWUI: History wieder maskiert
+        OWUI->>LLM: Fortsetzung mit [[Typ-HASH]]-Platzhaltern
+    end
 ```
 
 ### Ablauf im Detail
@@ -71,9 +84,10 @@ sequenceDiagram
     - **Re-Maskierung der History**: `_remask_history()` schickt jede weitere Nachricht der Unterhaltung (`user`, `assistant`, `tool`) durch `_mask_text()` — Originalwert → Platzhalter, aus der Zuordnungstabelle des Chats, ohne API-Call. Nötig, weil `outlet()` die Originalwerte lokal festschreibt und Open WebUI diesen Verlauf mit der nächsten Frage wieder mitschickt. Fehlt die Tabelle (Neustart, Reload, anderer Worker), wird sie einmal je Chat aus der History rekonstruiert. Siehe [Kontext über mehrere Turns](#kontext-über-mehrere-turns).
 6. **`tool()`** wird für jedes Tool-Ergebnis gerufen — nicht von Open WebUI, sondern aus dem Monkey Patch von `middleware.process_tool_result()`, den der Filter beim Laden installiert. Das bereits zu Text normalisierte Ergebnis läuft durch dieselbe Anonymisierung wie die User-Message und geht maskiert als `role="tool"`-Message ans Modell. Steht der Tool-Name in der Valve `tool_filter_exclude`, wird das Ergebnis unverändert durchgereicht. Siehe [Tool-Ergebnisse](#tool-ergebnisse).
 7. **`stream()`** wird bei aktivem Streaming für jeden Chunk der Antwort gerufen. Chunks des Antworttexts gehen unverändert durch. Bei `output_filter = "deanonymized"` werden in Chunks mit `delta.tool_calls` die Platzhalter in `function.arguments` durch die Originalwerte aus der Zuordnungstabelle in `__metadata__` ersetzt, bevor Open WebUI die Argumente zusammensetzt und das Tool aufruft — siehe [Tool-Call-Argumente](#tool-call-argumente).
-8. **`outlet()`** wird nach der LLM-Antwort gerufen. Zuerst schreibt `_log_hash_pairs()` die in `__metadata__` gesammelte Zuordnungstabelle einmal ins Serverlog — ohne die Originalwerte. Danach: bei `output_filter = "deanonymized"` werden die Platzhalter der Assistant-Nachricht lokal aus denselben Paaren ersetzt, mit denen `stream()` arbeitet; kein Request ans Backend. Ersetzt wird in `message["content"]` **und** in den strukturierten `message["output"]`-Blöcken: das Frontend rendert eine Assistant-Nachricht seit Open WebUI 0.10 aus diesen Blöcken und greift auf `content` nur zurück, wenn keine da sind (`ContentRenderer.svelte`: `{#if output?.length}`) — eine gestreamte Antwort trägt sie immer, ohne diesen Schritt bliebe der Text mit Platzhaltern auf dem Bildschirm stehen. Jedes Textelement wird für sich ersetzt, Reihenfolge und Anzahl der Blöcke bleiben unangetastet; der Ansatz stammt aus dem PoC in [`hook_logger.py`](hook_logger.py). Anschließend schreibt `_persist_message()` die fertige Antwort über `Chats.upsert_message_to_chat_by_id_and_message_id()` in den gespeicherten Chat — sonst führt Open WebUI die Unterhaltung mit dem gestreamten, maskierten Text fort. Bei `"anonymized"` bleibt die Antwort unverändert, die Platzhalter bleiben sichtbar.
-9. **Statusmeldungen** („Processing files…", „Anonymizing content…", „Anonymizing result of &lt;tool&gt;…", „De-anonymizing content…") laufen über `__event_emitter__` und erscheinen im Chat-Verlauf.
-10. **Fehler**: `inlet()` meldet `❌ Anonymization failed: …` und wirft eine Exception — die Anfrage geht nicht ans LLM. `tool()` wirft nicht, sondern ersetzt das Tool-Ergebnis durch die Fehlermeldung (fail closed). `outlet()` wirft ebenfalls nicht, sondern stellt der Originalantwort die Fehlermeldung voran, damit die Antwort nicht verloren geht.
+8. **`outlet()`** wird nach der LLM-Antwort gerufen. Zuerst schreibt `_log_hash_pairs()` die in `__metadata__` gesammelte Zuordnungstabelle einmal ins Serverlog — ohne die Originalwerte. Danach: bei `output_filter = "deanonymized"` werden die Platzhalter der Assistant-Nachricht lokal aus denselben Paaren ersetzt, mit denen `stream()` arbeitet; kein Request ans Backend. Ersetzt wird in `message["content"]` **und** in den strukturierten `message["output"]`-Blöcken: das Frontend rendert eine Assistant-Nachricht aus diesen Blöcken und greift auf `content` nur zurück, wenn keine da sind (`ContentRenderer.svelte`: `{#if output?.length}`) — eine gestreamte Antwort trägt sie immer, ohne diesen Schritt bliebe der Text mit Platzhaltern auf dem Bildschirm stehen. Jedes Textelement wird für sich ersetzt, Reihenfolge und Anzahl der Blöcke bleiben unangetastet; der Ansatz stammt aus dem PoC in [`hook_logger.py`](hook_logger.py). Den Rest erledigt Open WebUI: `outlet_filter_handler()` vergleicht das Ergebnis mit der gespeicherten Nachricht und schreibt zurück, was sich geändert hat — `content`, `output` und den vorherigen Text als `originalContent`. Der gespeicherte Chat trägt ab hier den Klartext, sonst führte Open WebUI die Unterhaltung mit dem gestreamten, maskierten Text fort. Bei `"anonymized"` bleibt die Antwort unverändert, die Platzhalter bleiben sichtbar.
+9. **`request()`** wird seit Open WebUI 0.11.2 vor **jedem** Provider-Call gerufen — am Ende von `process_chat_payload()`, nach einer Tool-Freigabe und vor jeder Fortsetzung der Tool-Call- und Code-Interpreter-Schleife. Das ist die letzte Stelle vor dem Modell, und sie sieht alles, was Open WebUI dem Body **nach** `inlet()` noch hinzufügt. Der Hook schickt den gesamten Verlauf erneut durch `_mask_messages()` — lokal, idempotent, ohne API-Call. Siehe [Der `request`-Hook](#der-request-hook).
+10. **Statusmeldungen** („Processing files…", „Anonymizing content…", „Anonymizing result of &lt;tool&gt;…", „De-anonymizing content…") laufen über `__event_emitter__` und erscheinen im Chat-Verlauf.
+11. **Fehler**: `inlet()` meldet `❌ Anonymization failed: …` und wirft eine Exception — die Anfrage geht nicht ans LLM. `tool()` wirft nicht, sondern ersetzt das Tool-Ergebnis durch die Fehlermeldung (fail closed). `outlet()` wirft ebenfalls nicht, sondern stellt der Originalantwort die Fehlermeldung voran, damit die Antwort nicht verloren geht.
 
 ---
 
@@ -101,7 +115,6 @@ sequenceDiagram
 | `tool_filter_exclude` | `""` | Kommagetrennte Liste von Tool-Namen, deren Ergebnis **nicht** maskiert und unverändert an das LLM durchgereicht wird, z.B. `get_time, enaio_*`. Groß-/Kleinschreibung egal, Wildcards erlaubt — siehe [Ausgeschlossene Tools](#ausgeschlossene-tools). Wirkt nur, solange `tool_filter` an ist. ⚠️ Das Ergebnis eines ausgeschlossenen Tools erreicht das Modell im Klartext. Leer = jedes Tool-Ergebnis wird maskiert. |
 | `history_remasking` | `true` | Maskiert vor dem Senden die **gesamte** Unterhaltung, nicht nur die neueste User-Message — nötig, weil der lokale Kontext die Originalwerte hält. Läuft lokal aus der Zuordnungstabelle des Chats, ohne weiteren API-Call; fehlt sie, wird sie einmal je Chat mit einem Job aus der History rekonstruiert. Aus = altes Verhalten, nur die letzte User-Message wird maskiert. Siehe [Kontext über mehrere Turns](#kontext-über-mehrere-turns). |
 | `chat_mapping_max_chats` | `200` | Wie viele Chats ihre Zuordnungstabelle im Speicher behalten (LRU). Fällt ein Chat heraus, lassen sich seine alten Platzhalter nicht mehr auflösen und sein Klartext nicht mehr re-maskieren. ⚠️ Die Tabelle enthält die Originalwerte — dieser Wert begrenzt damit auch die PII im Prozessspeicher. |
-| `persist_local_answer` | `true` | Schreibt die de-anonymisierte Antwort über `open_webui.models.chats` in den gespeicherten Chat zurück, damit der lokale Kontext die Originalwerte behält statt der Platzhalter des Streams. Aus, wenn die eingesetzte Open-WebUI-Version das `outlet()`-Ergebnis ohnehin persistiert. |
 | `log_tool_payload` | `false` | Schreibt die Parameter jedes `process_tool_result()`-Aufrufs sowie jedes Tool-Ergebnis vor und nach der Maskierung vollständig ins Serverlog. ⚠️ Das rohe Ergebnis steht damit im Klartext im Log. Aus = kompakte Zeilen mit Typ, Länge und Korrelations-IDs. |
 | `priority` | `10` | Ausführungsreihenfolge unter mehreren Filtern; kleinere Werte laufen zuerst. |
 
@@ -147,12 +160,13 @@ Alles in `class Filter` in [`anonymize.py`](anonymize.py):
 | HTTP | `_anymize_api_request()` — aiohttp-Wrapper für GET/POST mit Bearer-Auth |
 | API-Calls | `_anonymize_text()`, `_get_anonymization_status()`, `upload_file_from_path_for_ocr()` |
 | Job-Polling | `_poll_status()` — pollt bis `status == "completed"`, `max_retries=150`, `retry_interval=500` ms |
-| Chat-Mapping | Modul-Ebene: `_STATE` — Prozess-Speicher je `chat_id`, überlebt das Neu-Laden des Filter-Moduls; `_chat_entry()`, `_chat_pairs()`, `_remember_pairs()` — Ablage mit LRU-Deckel; `_alias_placeholders()` — frischer Platzhalter → der im Chat schon genutzte; `_canonical_placeholders()` — Originalwert → Platzhalter für die Maskierung; `_mask_text()` — die Ersetzung in Gegenrichtung zu `_replace_placeholders()`; `_apply_to_message_text()`, `_message_text()` — Text einer Nachricht in allen drei Formen (String, Parts-Liste, `output`-Blöcke); `_orphan_placeholders()` — Platzhalter, die keine Tabelle mehr auflöst. In der Klasse: `_remask_history()`, `_rebuild_chat_mapping()`, `_persist_message()` |
+| Chat-Mapping | Modul-Ebene: `_STATE` — Prozess-Speicher je `chat_id`, überlebt das Neu-Laden des Filter-Moduls; `_chat_entry()`, `_chat_pairs()`, `_remember_pairs()` — Ablage mit LRU-Deckel; `_alias_placeholders()` — frischer Platzhalter → der im Chat schon genutzte; `_canonical_placeholders()` — Originalwert → Platzhalter für die Maskierung; `_mask_text()` — die Ersetzung in Gegenrichtung zu `_replace_placeholders()`; `_apply_to_message_text()`, `_message_text()` — Text einer Nachricht in allen drei Formen (String, Parts-Liste, `output`-Blöcke); `_orphan_placeholders()` — Platzhalter, die keine Tabelle mehr auflöst. In der Klasse: `_remask_history()` — die History in `inlet()`, `_mask_messages()` — die Ersetzungsschleife, die `_remask_history()` und `request()` teilen, `_rebuild_chat_mapping()` |
 | Datei-Handling | `get_file_paths()`, `process_multiple_files_for_ocr()` — Upload und Polling parallel via `asyncio.gather()` |
 | Orchestrierung | `_anonymize_content()` — ein Text von der Abgabe bis zum maskierten Ergebnis (Job, Polling, Zuordnungstabelle); genutzt von `process_input()` und `tool()`. `process_input()` — sammelt Inhalte, ruft die Anonymisierung, überschreibt die letzte User-Message |
-| Open-WebUI-Hooks | `inlet()` (vor dem LLM), `stream()` (je Chunk), `outlet()` (nach dem LLM) — alle mit `__metadata__` |
+| Open-WebUI-Hooks | `inlet()` (vor dem LLM), `request()` (vor jedem Provider-Call, ab 0.11.2), `stream()` (je Chunk), `outlet()` (nach dem LLM) — alle mit `__metadata__` |
+| Monkey Patch | Modul-Ebene: `_unwrap()`, `_bind_call()`, `_install_process_tool_result_patch()` — `middleware.process_tool_result` für die Tool-Ergebnisse, in `__init__()` installiert und über Reloads hinweg idempotent; `_check_owui_version()` — prüft die Open-WebUI-Version gegen `_MIN_OWUI_VERSION` |
 | Rückabbildung | Modul-Ebene: `_placeholder_map()` — Platzhalter → Originalwert aus den Hash-Paaren, mit `for_json=True` JSON-escaped für `stream()`, roh für `outlet()`; `_replace_placeholders()` — die Ersetzung selbst, von beiden genutzt; `_split_pending()` — hält einen über Chunk-Grenzen zerteilten Platzhalter zurück. In der Klasse: `_deanonymize_tool_calls()` — bearbeitet einen Chunk; `_deanonymize_message()` — ersetzt in einer Assistant-Message, `_output_text_items()` — findet den vom Frontend gerenderten Text in `message["output"]`, `_prefix_assistant_text()` — stellt der Antwort die Fehlermeldung voran; `_log_missing_pairs()` — Warnung einmal je Request |
-| Tool-Ergebnisse | Modul-Ebene: `_unwrap()`, `_bind_tool_call()`, `_anonymize_tool_result()`, `_install_process_tool_result_patch()` — Monkey Patch; `_filter_enabled()` — Zustand des Chat-Schalters aus `metadata["filter_ids"]`; `_parse_tool_patterns()`, `_tool_excluded()` — Auswertung der Valve `tool_filter_exclude`. In der Klasse: `tool()` — siehe [Tool-Ergebnisse](#tool-ergebnisse) |
+| Tool-Ergebnisse | Modul-Ebene: `_anonymize_tool_result()`; `_filter_enabled()` — Zustand des Chat-Schalters aus `metadata["filter_ids"]`; `_parse_tool_patterns()`, `_tool_excluded()` — Auswertung der Valve `tool_filter_exclude`. In der Klasse: `tool()` — siehe [Tool-Ergebnisse](#tool-ergebnisse) |
 
 ### Hash-Paare in `__metadata__`
 
@@ -201,13 +215,15 @@ Eine reale Antwort von `GET /api/status/{job_id}/strings` sieht so aus:
 
 ### Kontext über mehrere Turns
 
-> Gilt bei `output_filter = "deanonymized"`. Im Modus `"anonymized"` wird nichts zurückgesetzt, der gespeicherte Verlauf trägt weiter seine Platzhalter — es gibt nichts zu re-maskieren, und `_remask_history()` steigt sofort aus.
+> Gilt bei `output_filter = "deanonymized"`. Im Modus `"anonymized"` wird nichts zurückgesetzt, der gespeicherte Verlauf trägt weiter seine Platzhalter — es gibt nichts zu re-maskieren, und `_remask_history()` wie `request()` steigen sofort aus.
 
 Ein Chat ist keine Folge unabhängiger Requests: Open WebUI schickt mit jeder Frage den gesamten bisherigen Verlauf mit. Daraus folgen drei Dinge, die eine Tabelle je Request nicht leisten kann.
 
-**1. Der lokale Kontext hält die Originalwerte.** Was während des Streams zusammengesetzt wird, ist der maskierte Text; ohne Zutun führt Open WebUI die Unterhaltung damit fort. `_persist_message()` schreibt die von `outlet()` de-anonymisierte Fassung deshalb noch einmal in den gespeicherten Chat — `content` und, falls vorhanden, die `output`-Blöcke. Der Aufruf ist defensiv gebaut: fehlende `chat_id`/`message_id`, eine Open-WebUI-Version ohne `upsert_message_to_chat_by_id_and_message_id` oder ein Fehler beim Schreiben kosten eine Log-Zeile, nie die Antwort. Abschaltbar über `persist_local_answer`.
+**1. Der lokale Kontext hält die Originalwerte.** Was während des Streams zusammengesetzt wird, ist der maskierte Text; ohne Zutun führte Open WebUI die Unterhaltung damit fort. Das übernimmt Open WebUI selbst: `outlet_filter_handler()` vergleicht das Ergebnis von `outlet()` mit der gespeicherten Nachricht und schreibt `content` und `output` zurück, sobald sich eines von beiden geändert hat (der vorherige Text bleibt als `originalContent` erhalten). Der Filter muss dafür nur beide Textquellen konsistent halten — genau das tut `_deanonymize_message()` über `_output_text_items()`. Eine eigene Persistenz braucht es nicht mehr.
 
 **2. Die History wird vor dem Senden wieder maskiert.** `_remask_history()` läuft in `inlet()`, nach der Anonymisierung der neuen User-Message, über alle übrigen Nachrichten mit Rolle `user`, `assistant` oder `tool` — `content` als String, `content` als Parts-Liste und die `output`-Blöcke. Ersetzt wird Originalwert → Platzhalter, längster Originalwert zuerst, und nur außerhalb bereits vorhandener Platzhalter. Der Schritt ist idempotent und deckt beide Richtungen ab: ein Kontext mit Originalwerten wird maskiert, ein Kontext, der noch Platzhalter trägt, bleibt wie er ist und wird von `outlet()` aufgelöst. Originalwerte unter drei Zeichen bleiben außen vor (`_MIN_MASK_LEN`) — reine Textersetzung mit einem zweistelligen Original würde den halben Verlauf zerlegen. Der `system`-Prompt wird nicht angefasst.
+
+Dieselbe Ersetzung läuft ein zweites Mal in `request()`, unmittelbar vor jedem Provider-Call. `inlet()` ist nicht die letzte Station: Open WebUI fügt danach noch RAG- und Wissenskontext ein und baut den Verlauf nach einer Tool-Freigabe komplett aus dem gespeicherten Chat neu auf. Siehe [Der `request`-Hook](#der-request-hook).
 
 **3. Ein Platzhalter je Entität und Chat.** Jeder Job vergibt eigene Platzhalter; dieselbe Person wäre in Turn 1 `[[Person-HGCVVW]]` und in Turn 3 `[[Person-QWERTZ]]` — für das Modell zwei Personen. `_alias_placeholders()` vergleicht die Paare eines frischen Jobs mit denen des Chats und schreibt den neuen Platzhalter im gerade maskierten Text auf den zuerst vergebenen um. Beide bleiben in der Tabelle, damit die Rückrichtung auch einen Alias auflöst, der es doch bis zum Modell schafft.
 
@@ -247,7 +263,7 @@ Die Platzhalter aus Tool-Ergebnissen löst `outlet()` mit auf: `_store_hash_pair
 
 #### Chat-Schalter
 
-Derselbe Umweg, der die Tool-Ergebnisse überhaupt erreichbar macht, schneidet sie auch vom Ein-/Aus-Schalter im Chat ab: Der Monkey Patch hängt an `middleware` und läuft für **jeden** Tool-Call der Instanz, unabhängig davon, welche Filter die Anfrage aktiviert hat. `self.toggle` hilft dabei nicht — Open WebUI liest das Attribut einmal beim Aufbau der Filter-Kette und schreibt es nie zurück, es bleibt also immer `True`. Der Zustand des Schalters steckt allein in der Liste `metadata["filter_ids"]`, die der Client mitschickt (`main.py`: `"filter_ids": form_data.pop("filter_ids", [])`) und die auch `process_tool_result()` erhält.
+Derselbe Umweg, der die Tool-Ergebnisse überhaupt erreichbar macht, schneidet sie auch vom Ein-/Aus-Schalter im Chat ab: Der Monkey Patch hängt an `middleware` und läuft für **jeden** Tool-Call der Instanz, unabhängig davon, welche Filter die Anfrage aktiviert hat. Für die echten Hooks — `inlet()`, `request()`, `stream()`, `outlet()` — stellt sich die Frage nicht, die löst Open WebUI selbst auf. `self.toggle` hilft dabei nicht — Open WebUI liest das Attribut einmal beim Aufbau der Filter-Kette und schreibt es nie zurück, es bleibt also immer `True`. Der Zustand des Schalters steckt allein in der Liste `metadata["filter_ids"]`, die der Client mitschickt (`main.py`: `"filter_ids": form_data.pop("filter_ids", [])`) und die auch `process_tool_result()` erhält.
 
 `_filter_enabled()` wertet sie in `tool()` als Erstes aus, vor Valves, Ausschlussliste und Event-Emitter, und wendet damit dieselbe Regel an, mit der Open WebUI über `inlet()`/`outlet()` entscheidet. Die eigene Function-ID liest das Modul aus seinem eigenen `__name__`, das Open WebUI beim Laden als `function_<id>` setzt. Ist der Schalter aus, geht das Tool-Ergebnis unverändert an das Modell — kein Job, keine Statusanzeige, eine Zeile im Log.
 
@@ -332,9 +348,48 @@ Drei Details:
 
 ---
 
+### Der `request`-Hook
+
+Open WebUI 0.11.2 hat einen neuen Filter-Typ eingeführt:
+
+```python
+async def request(self, body: dict, __metadata__=None, __user__=None) -> dict:
+```
+
+Er läuft **vor jedem einzelnen Provider-Call**, an vier Stellen in `utils/middleware.py`:
+
+| Stelle | Wann |
+|---|---|
+| Ende von `process_chat_payload()` | vor dem ersten Modell-Aufruf des Turns |
+| in `drain_approved_tool_calls()` | nachdem ein freigegebener Tool-Call abgearbeitet wurde (nur wenn nicht erneut angehalten) |
+| in der nativen Tool-Call-Schleife | vor jeder Fortsetzung mit den Tool-Ergebnissen |
+| in der Code-Interpreter-Schleife | vor jeder Fortsetzung mit dem Ausführungsergebnis |
+
+Damit ist er die letzte Stelle, an der überhaupt noch maskiert werden kann — und die einzige, die sieht, was Open WebUI dem Body **nach** `inlet()` noch hinzufügt:
+
+- den Verlauf, den Open WebUI nach einer **Tool-Freigabe** komplett aus dem gespeicherten Chat neu aufbaut (`load_messages_from_db()` plus `process_messages_with_output()`). Der gespeicherte Chat trägt Klartext — die de-anonymisierte Antwort schreibt Open WebUI selbst zurück, und die getippte Nachricht des Nutzers stand dort ohnehin unmaskiert. Alles, was `inlet()` maskiert hat, ist an dieser Stelle verworfen.
+- die `<source>`-Blöcke von **RAG, Wissensdateien, Web-Suche** und von Tool-Calls im **Legacy-Modus** (`function_calling != native`). Sie werden in `process_chat_payload()` nach `inlet()` in die User-Message eingefügt (`apply_source_context_to_messages()`).
+- die Nachrichten, die für die **nächste Runde eines Tool-Calls** aus den `output`-Blöcken zusammengesetzt werden.
+
+Der Hook ersetzt Originalwert → Platzhalter über dasselbe `_mask_messages()`, das `_remask_history()` in `inlet()` nutzt: aus der Zuordnungstabelle des Chats, ohne API-Call, idempotent. Eine bereits maskierte Nachricht bleibt unverändert, mehrere Aufrufe je Antwort kosten daher nichts außer Textdurchläufen.
+
+Drei Details:
+
+- **Kein Monkey Patch mehr für diesen Pfad.** Bis Version 1.8.0 hat der Filter `main.drain_approved_tool_calls()` gepatcht, um genau diese Lücke zu schließen. Open WebUI ruft `request()` jetzt selbst innerhalb dieser Funktion auf — der Patch ist entfallen.
+- **Fail closed**: Anders als `stream()` schluckt dieser Pfad keine Fehler. Der Body enthält an dieser Stelle Klartext; bricht die Maskierung, muss der Request scheitern statt weiterzulaufen. Open WebUI macht daraus eine Fehlermeldung im Chat.
+- **Der Chat-Schalter wird hier nicht selbst geprüft.** Open WebUI löst die Filter-Pipeline für `request` über dasselbe `get_filter_functions()` auf wie für `inlet()`; ein im Chat abgeschalteter Filter wird gar nicht gerufen. Der Hook steigt zusätzlich aus bei `history_remasking = false`, bei `output_filter = "anonymized"` (dann steht nirgends Klartext, den man re-maskieren müsste) und ohne `chat_id` (temporärer Chat, direkter API-Aufruf — dort gibt es keine Zuordnungstabelle).
+
+| Fall | Meldung |
+|---|---|
+| Version geprüft | `Anymize <version>: running on Open WebUI <v> (needs 0.11.2 or newer)` |
+| Zu alt | `Anymize <version>: Open WebUI <v> is older than the 0.11.2 this filter needs — …` |
+| Maskiert | `Anonymize request: <n> value(s) masked again in <m> message(s) of the history` |
+
+---
+
 ## Voraussetzungen
 
-- **Open WebUI** — der Filter importiert `open_webui.utils.misc.get_last_user_message` und `open_webui.config.UPLOAD_DIR`, dazu bei Bedarf `open_webui.socket.main.get_event_emitter` (Statusmeldungen aus dem Tool-Pfad), `open_webui.utils.middleware` (Monkey Patch) und `open_webui.models.chats.Chats` (Persistenz der de-anonymisierten Antwort). Die letzten drei werden erst im Aufruf importiert und fehlen still, mit Log-Zeile. Außerhalb von Open WebUI läuft die Datei nicht.
+- **Open WebUI 0.11.2 oder neuer** (geprüft gegen 0.11.4). Ältere Versionen werden nicht unterstützt: ab 0.11.1 schreibt Open WebUI das Ergebnis von `outlet()` vollständig zurück (`content` **und** `output`), und 0.11.2 bringt den `request`-Hook, ohne den der Verlauf nach einer Tool-Freigabe und der RAG-Kontext unmaskiert ans Modell gehen. Beim Laden prüft `_check_owui_version()` die installierte Version aus `open_webui.env.VERSION` und schreibt eine Warnung, wenn sie darunter liegt. Der Filter importiert `open_webui.utils.misc.get_last_user_message` und `open_webui.config.UPLOAD_DIR`, dazu bei Bedarf `open_webui.socket.main.get_event_emitter` (Statusmeldungen aus dem Tool-Pfad) und `open_webui.utils.middleware` (Monkey Patch der Tool-Ergebnisse). Die letzten zwei werden erst im Aufruf importiert; fehlen sie, gibt es eine Log-Zeile. Außerhalb von Open WebUI läuft die Datei nicht.
 - **Python-Pakete**: `aiohttp`, `pydantic` (beide in Open WebUI bereits vorhanden).
 - API-Key eines Anonymisierungs-Dienstes.
 - Für die Rückabbildung gilt: sie hängt vollständig an `GET /api/status/{job_id}/strings`, das direkt nach der Anonymisierung im selben Request abgefragt wird. **Zero Data Retention (ZDR) muss im Account deaktiviert sein** — mit aktivem ZDR speichert das Backend keine Zuordnung, der Abruf liefert nichts, und nur `output_filter = "anonymized"` ist sinnvoll. Dass der Job später abläuft, spielt dagegen keine Rolle mehr: die Paare liegen ab dem Abruf im Request.
@@ -343,14 +398,14 @@ Drei Details:
 
 ## Bekannte Einschränkungen
 
-Stand der aktuellen Fassung von `anonymize.py` (Version 1.7.0):
+Stand der aktuellen Fassung von `anonymize.py` (Version 1.9.0, Open WebUI 0.11.4):
 
 - **Die Zuordnungstabelle eines Chats lebt im Prozess**: Ein Neustart, ein Reload des Filters, ein zweiter Worker oder der LRU-Deckel `chat_mapping_max_chats` lassen sie verschwinden. Danach sind die Platzhalter älterer Turns unauflösbar — sie bleiben im Chat stehen — und der Klartext des Verlaufs wird über `_rebuild_chat_mapping()` neu erkannt, also mit einem zusätzlichen Job und mit dem, was die API diesmal findet. Mehrere Worker teilen die Tabelle nicht: ein Chat, der zwischen ihnen hin- und herspringt, baut sie mehrfach auf.
 - **Der lokale Kontext enthält jetzt bewusst Klartext-PII** — in der Open-WebUI-Datenbank und im Prozessspeicher. Das ist die Bedingung dafür, dass der Verlauf lesbar bleibt; siehe [Datenschutz-Hinweis](#datenschutz-hinweis).
 - **Die Re-Maskierung ist reine Textersetzung**: eine flektierte, abgekürzte oder anders geschriebene Variante eines bekannten Originalwerts wird nicht getroffen und geht im Klartext ans Modell. Originalwerte unter drei Zeichen werden gar nicht erst ersetzt.
 - **Ohne `chat_id` gibt es keine Re-Maskierung**: In temporären Chats und bei direkten Aufrufen von `/api/chat/completions` bleibt der Verlauf so, wie er hereinkommt; nur die neue User-Message wird anonymisiert.
 - **Die Kanonisierung der Platzhalter hängt an exakter Gleichheit des Originalwerts**: Schreibt die API denselben Namen einmal mit und einmal ohne Titel, sind das zwei Einträge und damit zwei Platzhalter.
-- **`_persist_message()` greift in Open-WebUI-Interna**: fehlt `Chats.upsert_message_to_chat_by_id_and_message_id` oder ändert sich seine Signatur, wird die de-anonymisierte Antwort nicht mehr gespeichert — sichtbar nur an einer Log-Zeile. Der Verlauf trägt dann wieder Platzhalter; auflösen kann sie der Filter weiterhin, solange die Tabelle des Chats im Prozess liegt.
+- **Die Persistenz der de-anonymisierten Antwort liegt bei Open WebUI**: `outlet_filter_handler()` schreibt zurück, was der Filter geändert hat. Ändert sich dieses Verhalten wieder, trägt der gespeicherte Verlauf ab dem zweiten Turn wieder Platzhalter; auflösen kann sie der Filter weiterhin, solange die Tabelle des Chats im Prozess liegt.
 - **Datei-Anonymisierung (`/api/ocr`) liefert keine Hash-Paare**: Der OCR-Pfad pollt direkt und läuft nicht durch `_store_hash_pairs()`. Was nur in einer Datei stand, taucht damit weder in der Rückabbildung noch in der Re-Maskierung auf.
 
 - **Jeder Eintrag in `tool_filter_exclude` ist ein bewusster Klartext-Pfad zum LLM**: Das Ergebnis eines ausgeschlossenen Tools wird nicht geprüft, sondern ungesehen durchgereicht — liefert das Tool später doch PII (geänderte Query, erweiterte API, anderer Datenbestand), fällt das nicht auf. Ein zu weit gefasstes Wildcard (`*` oder ein Präfix, das mehr Tools trifft als gedacht) schaltet die Tool-Anonymisierung faktisch ab, ohne dass `tool_filter` auf `false` steht.
@@ -359,13 +414,16 @@ Stand der aktuellen Fassung von `anonymize.py` (Version 1.7.0):
 - **`tool_result_files` und `tool_result_embeds` bleiben unmaskiert**: Inline-HTML-Embeds und Bilder eines Tools reicht der Wrapper unverändert durch. Sie gehen an das Frontend, nicht an das LLM — im Chat sichtbare PII ist damit weiterhin möglich.
 - **Jeder Tool-Call kostet einen eigenen Anonymisierungs-Job** inklusive Polling. Bei mehreren Tool-Calls je Antwort summiert sich das spürbar (siehe nächster Punkt).
 - **Blockierendes Polling**: `_poll_status()` versucht es bis zu 150-mal im Abstand von 500 ms — im Extremfall hängt eine Anfrage 75 Sekunden, bevor der Timeout greift.
+- **Chunks im Format der Responses-API bleiben unberührt**: `stream()` sucht nach `choices[].delta.tool_calls`. Liefert der Pfad stattdessen Ereignisse der Responses-API (`response.function_call_arguments.delta`), gibt es kein `choices[]` — der Chunk geht unverändert durch, und die Platzhalter bleiben in den Tool-Argumenten stehen.
+- **`request()` maskiert nur, was die Zuordnungstabelle des Chats kennt**: Ein Name, der ausschließlich in einem RAG-Dokument, einer Wissensdatei oder einem Web-Suchergebnis steht, war nie bei der API und hat deshalb keinen Platzhalter — er geht im Klartext ans Modell. Der Hook ruft bewusst keine API: er läuft mehrfach je Antwort, ein Job je Provider-Call würde die Latenz vervielfachen. Wer PII in Wissensdateien erwartet, maskiert sie vor dem Upload.
+- **`request()` lässt die `system`-Nachricht in Ruhe** (`REMASK_ROLES` deckt `user`, `assistant`, `tool` ab). Open WebUI schreibt dorthin Skill-Manifeste, Terminal-Kontext und `AGENTS.md`; steht darin PII, bleibt sie stehen.
 - **Keine Streaming-De-Anonymisierung des Antworttexts**: `stream()` bearbeitet nur die Argumente von Tool-Calls; die Chunks des Antworttexts gehen unverändert durch. Die De-Anonymisierung der Antwort bleibt in `outlet()` auf der fertigen Nachricht, der Nutzer sieht während der Ausgabe weiterhin die rohen Platzhalter.
 - **Im Modus `anonymized` laufen Tool-Calls ins Leere**: ohne Zuordnungstabelle bekommt ein Tool `[[Person-HGCVVW]]` als Parameter und findet nichts. Das ist die Konsequenz daraus, dass ein Schalter beides steuert, und im Log an einer Warnung je Request erkennbar.
 - **Ein zusätzlicher GET je Anonymisierungs-Job**: `GET /api/status/{job_id}/strings` läuft im Modus `deanonymized` — dem Default — nach jedem Job, also auch nach jedem Tool-Ergebnis. Dafür entfällt der frühere `POST /api/deanonymize` je Antwort.
 - **Nur die letzte User-Message geht durch die API**: Ältere Nachrichten werden lokal maskiert, aus dem, was die Tabelle des Chats kennt. PII, die dort nie ankam — etwa ein Name, den erst das Modell in seine Antwort geschrieben hat —, bleibt im Verlauf im Klartext. Mit `history_remasking = false` gilt wieder das alte Verhalten: der gesamte Verlauf geht unverändert ans LLM.
 - **Job-ID im Log**: `logging.warning(f"Anymize JobID: …")` schreibt die Job-ID jeder Anonymisierung auf Warn-Level ins Serverlog.
-- **`__metadata__` ist nicht in jedem Aufrufpfad garantiert**: Laut Open-WebUI-Doku läuft `outlet()` bei WebUI-Requests und über `/api/chat/completed`; für direkte Aufrufe von `/api/chat/completions` braucht es `ENABLE_API_OUTLET_FILTERS` auf `dev`/kommenden Releases. In Pfaden ohne Metadata gibt es keine Rückabbildung: die Paare können nirgends abgelegt werden, und `stream()` wie `outlet()` finden nichts zum Ersetzen.
-- **Die `output`-Blöcke sind an die Open-WebUI-Struktur gebunden**: `outlet()` schreibt die Antwort nach `content` **und** in die `message["output"]`-Blöcke, weil das Frontend seit 0.10 daraus rendert. Erwartet wird dabei `{"type": "message", "content": [{"type": "output_text", "text": …}]}`; ändert Open WebUI dieses Format, greift die Ersetzung nur noch in `content` — sichtbar bleibt dann wieder der Text mit Platzhaltern. Jede Ebene wird einzeln geprüft, ein unbekannter Aufbau führt nicht zu einem Fehler.
+- **`__metadata__` ist nicht in jedem Aufrufpfad garantiert**: `outlet()` läuft bei WebUI-Requests, über `/api/chat/completed` und — solange `ENABLE_API_OUTLET_FILTERS` an ist, der Default — auch bei direkten Aufrufen von `/api/chat/completions`. In Pfaden ohne Metadata gibt es keine Rückabbildung: die Paare können nirgends abgelegt werden, und `stream()` wie `outlet()` finden nichts zum Ersetzen.
+- **Die `output`-Blöcke sind an die Open-WebUI-Struktur gebunden**: `outlet()` schreibt die Antwort nach `content` **und** in die `message["output"]`-Blöcke, weil das Frontend daraus rendert. Erwartet wird dabei `{"type": "message", "content": [{"type": "output_text", "text": …}]}`; ändert Open WebUI dieses Format, greift die Ersetzung nur noch in `content` — sichtbar bleibt dann wieder der Text mit Platzhaltern. Jede Ebene wird einzeln geprüft, ein unbekannter Aufbau führt nicht zu einem Fehler.
 
 ---
 
@@ -381,7 +439,7 @@ Der Filter schickt Chat-Inhalte und hochgeladene Dateien an externe APIs — die
 
 Die Kopie in `__metadata__` ist auf den einzelnen Request begrenzt und wird mit ihm verworfen. Die Tabelle des Chats in `_STATE` lebt dagegen so lange wie der Prozess: sie enthält **Platzhalter und Originalwerte** jeder Entität, die in diesem Chat je erkannt wurde, im Klartext im Arbeitsspeicher von Open WebUI. Gehalten wird sie je `chat_id`, begrenzt durch `chat_mapping_max_chats` (LRU) — kein geteilter Zustand zwischen Chats, aber sehr wohl ein prozessweiter über die Chats hinweg. Das ist der Preis dafür, dass eine Unterhaltung lesbar bleibt und trotzdem maskiert ans Modell geht.
 
-**Der gespeicherte Chat enthält Klartext**: `persist_local_answer` schreibt die de-anonymisierte Antwort in die Open-WebUI-Datenbank. Die PII des Nutzers stand dort ohnehin — Open WebUI speichert die getippte Nachricht unmaskiert —, neu ist, dass auch die Antwort des Modells sie enthält. Wer das nicht will, setzt `persist_local_answer` und `history_remasking` aus: dann bleibt der gespeicherte Verlauf maskiert, und im Chat stehen ab dem zweiten Turn wieder Platzhalter.
+**Der gespeicherte Chat enthält Klartext**: Open WebUI schreibt die von `outlet()` de-anonymisierte Antwort in seine Datenbank — `content` und die `output`-Blöcke. Die PII des Nutzers stand dort ohnehin, Open WebUI speichert die getippte Nachricht unmaskiert; neu ist, dass auch die Antwort des Modells sie enthält. Wer das nicht will, stellt `output_filter` auf `"anonymized"`: dann wird nichts zurückgesetzt, der gespeicherte Verlauf bleibt maskiert, und im Chat stehen Platzhalter — der Preis dafür ist, dass auch Tool-Calls nur Platzhalter als Argumente bekommen.
 
 Zero Data Retention ist eine Kontoeinstellung, kein Request-Parameter. Mit ZDR speichert das Backend keine Zuordnung zwischen Platzhalter und Originalwert — dann liefert `GET /api/status/{job_id}/strings` nichts, und weder die Antwort noch die Tool-Call-Argumente lassen sich zurückübersetzen. Die Maskierung selbst bleibt davon unberührt, sie kommt immer von der API.
 
