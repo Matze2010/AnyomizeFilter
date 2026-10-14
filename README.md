@@ -6,7 +6,7 @@ Die Anonymisierung selbst passiert nicht lokal, sondern über die externe API. D
 
 **Lokal steht der Klartext, ausgehend die Platzhalter.** Die de-anonymisierte Antwort landet im gespeicherten Chat — Open WebUI schreibt das Ergebnis von `outlet()` selbst zurück —, und weil dieser Verlauf mit der nächsten Frage wieder mitgeschickt wird, maskiert `inlet()` die **gesamte** Unterhaltung erneut — lokal, aus der Zuordnungstabelle des Chats, ohne weiteren API-Call. Dieselbe Person behält dabei über alle Turns denselben Platzhalter. Siehe [Kontext über mehrere Turns](#kontext-über-mehrere-turns).
 
-Der gesamte Filter steckt in einer Datei: [`anonymize.py`](anonymize.py). Vorausgesetzt wird **Open WebUI 0.11.2 oder neuer** (geprüft gegen 0.11.4), siehe [Voraussetzungen](#voraussetzungen).
+Der gesamte Filter steckt in einer Datei: [`anonymize.py`](anonymize.py). Vorausgesetzt wird **Open WebUI 0.11.2 oder neuer** (geprüft gegen 0.11.4 und 0.12.0), siehe [Voraussetzungen](#voraussetzungen).
 
 ---
 
@@ -65,11 +65,14 @@ sequenceDiagram
         OWUI->>OWUI: content + output in den gespeicherten Chat schreiben
     end
     F-->>U: Antwort mit echten Werten
-    opt Tool-Freigabe
+    opt Tool-Freigabe (0.12.0)
         U->>OWUI: Tool-Call freigeben
-        OWUI->>OWUI: drain_approved_tool_calls() — History aus dem Chat neu aufgebaut
-        OWUI->>F: request(body)
-        F-->>OWUI: History wieder maskiert
+        OWUI->>F: inlet(body) — History aus dem gespeicherten Chat
+        F-->>OWUI: History maskiert
+        OWUI->>F: request(Kopie) — resume_tool_calls(), vor der Ausführung
+        OWUI->>OWUI: freigegebene Tools ausführen, process_tool_result() (gepatcht) → tool()
+        OWUI->>F: request(body) — mit der fortgesetzten Assistant-Message
+        F-->>OWUI: Body nachmaskiert
         OWUI->>LLM: Fortsetzung mit [[Typ-HASH]]-Platzhaltern
     end
 ```
@@ -97,7 +100,7 @@ sequenceDiagram
 2. Inhalt von [`anonymize.py`](anonymize.py) einfügen und speichern. Titel, Autor und Version zieht Open WebUI aus dem Docstring am Dateianfang.
 3. Function aktivieren und entweder global oder pro Modell zuweisen.
 4. Unter **Valves** den API-Key hinterlegen (siehe unten).
-5. Im Chat lässt sich der Filter über sein Icon ein- und ausschalten (`self.toggle = True`). Ist er aus, ruft Open WebUI `inlet()`, `stream()` und `outlet()` gar nicht erst auf — `self.toggle` bleibt dabei unverändert `True`, den Zustand des Schalters trägt allein `metadata["filter_ids"]`. Weil Tool-Ergebnisse nicht über die Filter-Pipeline laufen, sondern über den Monkey-Patch, prüft `_filter_enabled()` diese Liste dort ein zweites Mal; ist der Schalter aus, geht das Tool-Ergebnis unverändert an das Modell. Lässt sich der Zustand nicht ermitteln (fehlende Metadaten, ältere Open-WebUI-Version), wird sicherheitshalber anonymisiert.
+5. Im Chat lässt sich der Filter über sein Icon ein- und ausschalten (`self.toggle = True`). Ist er aus, ruft Open WebUI `inlet()`, `stream()` und `outlet()` gar nicht erst auf — `self.toggle` bleibt dabei unverändert `True`, den Zustand des Schalters trägt allein `metadata["filter_ids"]`. Weil Tool-Ergebnisse nicht über die Filter-Pipeline laufen, sondern über den Monkey-Patch, prüft `_filter_enabled()` diese Liste dort ein zweites Mal; ist der Schalter aus, geht das Tool-Ergebnis unverändert an das Modell. Die eigene Function-ID dafür liest der Filter aus seinem Modulnamen — `function_<id>` bis 0.11.x, `function_<id>_<uuid-hex>` ab 0.12.0 (`_function_id_from_module_name()`); sie steht in der Log-Zeile `process_tool_result patch installed (function id '<id>')` und muss dort der in Open WebUI vergebenen ID entsprechen. Lässt sich der Zustand nicht ermitteln (fehlende Metadaten, ältere Open-WebUI-Version), wird sicherheitshalber anonymisiert.
 
 ---
 
@@ -166,7 +169,7 @@ Alles in `class Filter` in [`anonymize.py`](anonymize.py):
 | Open-WebUI-Hooks | `inlet()` (vor dem LLM), `request()` (vor jedem Provider-Call, ab 0.11.2), `stream()` (je Chunk), `outlet()` (nach dem LLM) — alle mit `__metadata__` |
 | Monkey Patch | Modul-Ebene: `_unwrap()`, `_bind_call()`, `_install_process_tool_result_patch()` — `middleware.process_tool_result` für die Tool-Ergebnisse, in `__init__()` installiert und über Reloads hinweg idempotent; `_check_owui_version()` — prüft die Open-WebUI-Version gegen `_MIN_OWUI_VERSION` |
 | Rückabbildung | Modul-Ebene: `_placeholder_map()` — Platzhalter → Originalwert aus den Hash-Paaren, mit `for_json=True` JSON-escaped für `stream()`, roh für `outlet()`; `_replace_placeholders()` — die Ersetzung selbst, von beiden genutzt; `_split_pending()` — hält einen über Chunk-Grenzen zerteilten Platzhalter zurück. In der Klasse: `_deanonymize_tool_calls()` — bearbeitet einen Chunk; `_deanonymize_message()` — ersetzt in einer Assistant-Message, `_output_text_items()` — findet den vom Frontend gerenderten Text in `message["output"]`, `_prefix_assistant_text()` — stellt der Antwort die Fehlermeldung voran; `_log_missing_pairs()` — Warnung einmal je Request |
-| Tool-Ergebnisse | Modul-Ebene: `_anonymize_tool_result()`; `_filter_enabled()` — Zustand des Chat-Schalters aus `metadata["filter_ids"]`; `_parse_tool_patterns()`, `_tool_excluded()` — Auswertung der Valve `tool_filter_exclude`. In der Klasse: `tool()` — siehe [Tool-Ergebnisse](#tool-ergebnisse) |
+| Tool-Ergebnisse | Modul-Ebene: `_anonymize_tool_result()`; `_filter_enabled()` — Zustand des Chat-Schalters aus `metadata["filter_ids"]`, `_function_id_from_module_name()` — die eigene Function-ID dafür; `_parse_tool_patterns()`, `_tool_excluded()` — Auswertung der Valve `tool_filter_exclude`. In der Klasse: `tool()` — siehe [Tool-Ergebnisse](#tool-ergebnisse) |
 
 ### Hash-Paare in `__metadata__`
 
@@ -310,7 +313,7 @@ Erwartete Logzeilen:
 
 | Fall | Meldung |
 |---|---|
-| Patch installiert | `Anymize <version>: process_tool_result patch installed` |
+| Patch installiert | `Anymize <version>: process_tool_result patch installed (function id '<id>')` |
 | Modul neu geladen | `Anymize: replaced the process_tool_result patch of an older version` |
 | Funktion fehlt | `Anymize: middleware.process_tool_result not found — tool results are NOT anonymized on this Open WebUI version` |
 | Aufruf | `Anymize process_tool_result: <alle Parameter>` |
@@ -361,13 +364,13 @@ Er läuft **vor jedem einzelnen Provider-Call**, an vier Stellen in `utils/middl
 | Stelle | Wann |
 |---|---|
 | Ende von `process_chat_payload()` | vor dem ersten Modell-Aufruf des Turns |
-| in `drain_approved_tool_calls()` | nachdem ein freigegebener Tool-Call abgearbeitet wurde (nur wenn nicht erneut angehalten) |
+| bei einer fortgesetzten Tool-Freigabe | 0.11.x: in `drain_approved_tool_calls()`, nachdem ein freigegebener Tool-Call abgearbeitet wurde (nur wenn nicht erneut angehalten). Ab 0.12.0: in `resume_tool_calls()` **vor** der Ausführung, auf einer Kopie des Verlaufs, die die Tools als `__messages__` bekommen; danach läuft der Turn über das Ende von `process_chat_payload()` |
 | in der nativen Tool-Call-Schleife | vor jeder Fortsetzung mit den Tool-Ergebnissen |
 | in der Code-Interpreter-Schleife | vor jeder Fortsetzung mit dem Ausführungsergebnis |
 
 Damit ist er die letzte Stelle, an der überhaupt noch maskiert werden kann — und die einzige, die sieht, was Open WebUI dem Body **nach** `inlet()` noch hinzufügt:
 
-- den Verlauf, den Open WebUI nach einer **Tool-Freigabe** komplett aus dem gespeicherten Chat neu aufbaut (`load_messages_from_db()` plus `process_messages_with_output()`). Der gespeicherte Chat trägt Klartext — die de-anonymisierte Antwort schreibt Open WebUI selbst zurück, und die getippte Nachricht des Nutzers stand dort ohnehin unmaskiert. Alles, was `inlet()` maskiert hat, ist an dieser Stelle verworfen.
+- den Verlauf einer fortgesetzten **Tool-Freigabe**. Bis 0.11.x baut Open WebUI ihn nach `inlet()` komplett aus dem gespeicherten Chat neu auf (`load_messages_from_db()` plus `process_messages_with_output()`); der gespeicherte Chat trägt Klartext — die de-anonymisierte Antwort schreibt Open WebUI selbst zurück, und die getippte Nachricht des Nutzers stand dort ohnehin unmaskiert —, alles, was `inlet()` maskiert hat, ist an dieser Stelle verworfen. Ab 0.12.0 wird der Verlauf schon **vor** `inlet()` aus dem Chat geladen und von `_remask_history()` maskiert; nach `inlet()` kommt nur noch die angehaltene Assistant-Message samt Tool-Ergebnissen dazu.
 - die `<source>`-Blöcke von **RAG, Wissensdateien, Web-Suche** und von Tool-Calls im **Legacy-Modus** (`function_calling != native`). Sie werden in `process_chat_payload()` nach `inlet()` in die User-Message eingefügt (`apply_source_context_to_messages()`).
 - die Nachrichten, die für die **nächste Runde eines Tool-Calls** aus den `output`-Blöcken zusammengesetzt werden.
 
@@ -375,7 +378,7 @@ Der Hook ersetzt Originalwert → Platzhalter über dasselbe `_mask_messages()`,
 
 Drei Details:
 
-- **Kein Monkey Patch mehr für diesen Pfad.** Bis Version 1.8.0 hat der Filter `main.drain_approved_tool_calls()` gepatcht, um genau diese Lücke zu schließen. Open WebUI ruft `request()` jetzt selbst innerhalb dieser Funktion auf — der Patch ist entfallen.
+- **Kein Monkey Patch mehr für diesen Pfad.** Bis Version 1.8.0 hat der Filter `main.drain_approved_tool_calls()` gepatcht, um genau diese Lücke zu schließen. Open WebUI ruft `request()` jetzt selbst innerhalb dieser Funktion auf — der Patch ist entfallen. In 0.12.0 gibt es `drain_approved_tool_calls()` nicht mehr; an ihre Stelle tritt `resume_tool_calls()`, die `process_tool_result()` weiterhin über die Modul-Variable aufruft und damit durch den Patch der Tool-Ergebnisse läuft.
 - **Fail closed**: Anders als `stream()` schluckt dieser Pfad keine Fehler. Der Body enthält an dieser Stelle Klartext; bricht die Maskierung, muss der Request scheitern statt weiterzulaufen. Open WebUI macht daraus eine Fehlermeldung im Chat.
 - **Der Chat-Schalter wird hier nicht selbst geprüft.** Open WebUI löst die Filter-Pipeline für `request` über dasselbe `get_filter_functions()` auf wie für `inlet()`; ein im Chat abgeschalteter Filter wird gar nicht gerufen. Der Hook steigt zusätzlich aus bei `history_remasking = false`, bei `output_filter = "anonymized"` (dann steht nirgends Klartext, den man re-maskieren müsste) und ohne `chat_id` (temporärer Chat, direkter API-Aufruf — dort gibt es keine Zuordnungstabelle).
 
@@ -389,7 +392,7 @@ Drei Details:
 
 ## Voraussetzungen
 
-- **Open WebUI 0.11.2 oder neuer** (geprüft gegen 0.11.4). Ältere Versionen werden nicht unterstützt: ab 0.11.1 schreibt Open WebUI das Ergebnis von `outlet()` vollständig zurück (`content` **und** `output`), und 0.11.2 bringt den `request`-Hook, ohne den der Verlauf nach einer Tool-Freigabe und der RAG-Kontext unmaskiert ans Modell gehen. Beim Laden prüft `_check_owui_version()` die installierte Version aus `open_webui.env.VERSION` und schreibt eine Warnung, wenn sie darunter liegt. Der Filter importiert `open_webui.utils.misc.get_last_user_message` und `open_webui.config.UPLOAD_DIR`, dazu bei Bedarf `open_webui.socket.main.get_event_emitter` (Statusmeldungen aus dem Tool-Pfad) und `open_webui.utils.middleware` (Monkey Patch der Tool-Ergebnisse). Die letzten zwei werden erst im Aufruf importiert; fehlen sie, gibt es eine Log-Zeile. Außerhalb von Open WebUI läuft die Datei nicht.
+- **Open WebUI 0.11.2 oder neuer** (geprüft gegen 0.11.4 und 0.12.0). Für 0.12.0 ist **Filter-Version 1.9.1 oder neuer** nötig: 0.12.0 lädt Function-Module unter `function_<id>_<uuid-hex>`, und bis 1.9.0 hielt der Filter das angehängte Suffix für einen Teil seiner ID — der Chat-Schalter galt im Tool-Pfad dann immer als aus, und **jedes Tool-Ergebnis ging unmaskiert an das Modell**. Ältere Open-WebUI-Versionen werden nicht unterstützt: ab 0.11.1 schreibt Open WebUI das Ergebnis von `outlet()` vollständig zurück (`content` **und** `output`), und 0.11.2 bringt den `request`-Hook, ohne den der Verlauf nach einer Tool-Freigabe und der RAG-Kontext unmaskiert ans Modell gehen. Beim Laden prüft `_check_owui_version()` die installierte Version aus `open_webui.env.VERSION` und schreibt eine Warnung, wenn sie darunter liegt. Der Filter importiert `open_webui.utils.misc.get_last_user_message` und `open_webui.config.UPLOAD_DIR`, dazu bei Bedarf `open_webui.socket.main.get_event_emitter` (Statusmeldungen aus dem Tool-Pfad) und `open_webui.utils.middleware` (Monkey Patch der Tool-Ergebnisse). Die letzten zwei werden erst im Aufruf importiert; fehlen sie, gibt es eine Log-Zeile. Außerhalb von Open WebUI läuft die Datei nicht.
 - **Python-Pakete**: `aiohttp`, `pydantic` (beide in Open WebUI bereits vorhanden).
 - API-Key eines Anonymisierungs-Dienstes.
 - Für die Rückabbildung gilt: sie hängt vollständig an `GET /api/status/{job_id}/strings`, das direkt nach der Anonymisierung im selben Request abgefragt wird. **Zero Data Retention (ZDR) muss im Account deaktiviert sein** — mit aktivem ZDR speichert das Backend keine Zuordnung, der Abruf liefert nichts, und nur `output_filter = "anonymized"` ist sinnvoll. Dass der Job später abläuft, spielt dagegen keine Rolle mehr: die Paare liegen ab dem Abruf im Request.
@@ -398,7 +401,7 @@ Drei Details:
 
 ## Bekannte Einschränkungen
 
-Stand der aktuellen Fassung von `anonymize.py` (Version 1.9.0, Open WebUI 0.11.4):
+Stand der aktuellen Fassung von `anonymize.py` (Version 1.9.1, Open WebUI 0.12.0):
 
 - **Die Zuordnungstabelle eines Chats lebt im Prozess**: Ein Neustart, ein Reload des Filters, ein zweiter Worker oder der LRU-Deckel `chat_mapping_max_chats` lassen sie verschwinden. Danach sind die Platzhalter älterer Turns unauflösbar — sie bleiben im Chat stehen — und der Klartext des Verlaufs wird über `_rebuild_chat_mapping()` neu erkannt, also mit einem zusätzlichen Job und mit dem, was die API diesmal findet. Mehrere Worker teilen die Tabelle nicht: ein Chat, der zwischen ihnen hin- und herspringt, baut sie mehrfach auf.
 - **Der lokale Kontext enthält jetzt bewusst Klartext-PII** — in der Open-WebUI-Datenbank und im Prozessspeicher. Das ist die Bedingung dafür, dass der Verlauf lesbar bleibt; siehe [Datenschutz-Hinweis](#datenschutz-hinweis).
@@ -410,6 +413,7 @@ Stand der aktuellen Fassung von `anonymize.py` (Version 1.9.0, Open WebUI 0.11.4
 
 - **Jeder Eintrag in `tool_filter_exclude` ist ein bewusster Klartext-Pfad zum LLM**: Das Ergebnis eines ausgeschlossenen Tools wird nicht geprüft, sondern ungesehen durchgereicht — liefert das Tool später doch PII (geänderte Query, erweiterte API, anderer Datenbestand), fällt das nicht auf. Ein zu weit gefasstes Wildcard (`*` oder ein Präfix, das mehr Tools trifft als gedacht) schaltet die Tool-Anonymisierung faktisch ab, ohne dass `tool_filter` auf `false` steht.
 
+- **Der Chat-Schalter im Tool-Pfad hängt am Modulnamen**: `_filter_enabled()` erkennt seinen eigenen Eintrag in `metadata["filter_ids"]` über die aus dem Modulnamen abgeleitete Function-ID. Ändert Open WebUI das Namensschema erneut so, dass die ID zwar abgeleitet, aber falsch ist, gilt der Filter dort als abgeschaltet und Tool-Ergebnisse gehen im Klartext an das Modell — genau das ist mit 0.12.0 passiert. Nach jedem Upgrade lohnt der Blick auf `function id '<id>'` in der Log-Zeile des Patches.
 - **Der Patch von `process_tool_result()` greift in Open-WebUI-Interna ein** und kann bei jedem Upgrade brechen. Ändert sich die Signatur, wird sie über `inspect.signature()` weiterhin korrekt gebunden; verschwindet die Funktion, entfällt die Tool-Anonymisierung stillschweigend bis auf eine Log-Warnung.
 - **`tool_result_files` und `tool_result_embeds` bleiben unmaskiert**: Inline-HTML-Embeds und Bilder eines Tools reicht der Wrapper unverändert durch. Sie gehen an das Frontend, nicht an das LLM — im Chat sichtbare PII ist damit weiterhin möglich.
 - **Jeder Tool-Call kostet einen eigenen Anonymisierungs-Job** inklusive Polling. Bei mehreren Tool-Calls je Antwort summiert sich das spürbar (siehe nächster Punkt).
