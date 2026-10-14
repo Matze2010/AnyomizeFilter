@@ -2,7 +2,7 @@
 title: anonymize.py
 description: "Filter for anonymizing and deanonymizing text and files using an external API. The filter can be toggled on/off and configured via valves."
 author: Mathias Gisch
-version: 1.9.0
+version: 1.9.1
 """
 
 import asyncio
@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 
 # Logged when the patch is installed. Open WebUI shows no version anywhere, so
 # this is the only way to tell from a log which source is actually running.
-_VERSION = "1.9.0"
+_VERSION = "1.9.1"
 
 # The oldest Open WebUI this filter is built for. 0.11.2 added the "request"
 # filter hook that Filter.request() lives on; before it, everything Open WebUI
@@ -89,16 +89,32 @@ _PATCH_ORIGINAL = "_anymize_tool_original"
 # instance registers itself here in __init__.
 _active_filter = None
 
+
+def _function_id_from_module_name(name: str) -> Optional[str]:
+    """The function ID Open WebUI loaded a module under, or None.
+
+    utils/plugin.py names the module after the ID the user chose on import, so
+    the module name is the only place that ID can be read from:
+
+        up to 0.11.x   f"function_{function_id}"
+        from 0.12.0    f"function_{function_id}_{uuid4().hex}"
+
+    The 32 hex digits 0.12.0 appends have to come off again. Taking the rest
+    as the ID would yield one that is never in metadata["filter_ids"], and
+    _filter_enabled() would then report the filter as switched off for every
+    request — every tool result would reach the model in clear text.
+
+    Outside Open WebUI — tests, a direct import — the name does not match and
+    the ID stays None.
+    """
+
+    match = re.fullmatch(r"function_(.+?)(?:_[0-9a-f]{32})?", name or "")
+    return match.group(1) if match else None
+
+
 # The function ID this module was imported under, needed to recognize its own
 # entry in metadata["filter_ids"] — see _filter_enabled().
-#
-# Open WebUI loads every function module as f"function_{function_id}"
-# (utils/plugin.py), so the module name is the only place the ID the user chose
-# on import can be read from. Outside Open WebUI — tests, a direct import — the
-# name does not match and the ID stays None.
-_OWN_FUNCTION_ID = (
-    __name__[len("function_"):] if __name__.startswith("function_") else None
-)
+_OWN_FUNCTION_ID = _function_id_from_module_name(__name__)
 
 # Shape of a placeholder in the masked text: [[Type-HASH]], e.g.
 # [[Person-HGCVVW]]. _PLACEHOLDER_MAX_LEN is the point at which an unclosed
@@ -823,7 +839,12 @@ def _install_process_tool_result_patch() -> bool:
             "Anymize: replaced the process_tool_result patch of an older version"
         )
 
-    logging.warning(f"Anymize {_VERSION}: process_tool_result patch installed")
+    # The ID decides whether the chat switch is read correctly on this path —
+    # see _filter_enabled(). It belongs in the log next to the patch it guards.
+    logging.warning(
+        f"Anymize {_VERSION}: process_tool_result patch installed "
+        f"(function id {_OWN_FUNCTION_ID!r})"
+    )
     return True
 
 
@@ -1516,15 +1537,17 @@ class Filter:
         """Mask the conversation again, right before it goes to the provider.
 
         From Open WebUI 0.11.2 on this hook runs before every single provider
-        call (utils/middleware.py): at the end of process_chat_payload(), inside
-        drain_approved_tool_calls() once an approved tool call was drained, and
-        before each continuation of the native tool call and of the code
-        interpreter loop. inlet() is none of those places — it runs earlier, and
-        a great deal is added to the body after it:
+        call (utils/middleware.py): at the end of process_chat_payload(), when a
+        tool approval is resumed — inside drain_approved_tool_calls() up to
+        0.11.x, inside resume_tool_calls() before the approved tools run from
+        0.12.0 on — and before each continuation of the native tool call and of
+        the code interpreter loop. inlet() is none of those places — it runs
+        earlier, and a great deal is added to the body after it:
 
-          * the conversation rebuilt from the stored chat after a tool approval,
-            which carries the de-anonymized answer and the user's own message in
-            clear text,
+          * the conversation of a resumed tool approval: up to 0.11.x rebuilt
+            from the stored chat, with the de-anonymized answer and the user's
+            own message in clear text; from 0.12.0 on the paused assistant
+            message, appended after inlet(),
           * the <source> blocks of RAG, of knowledge files, of web search and of
             legacy (prompt-based) tool calls,
           * the messages assembled from the output blocks for the next round of

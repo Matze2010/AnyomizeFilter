@@ -8,6 +8,7 @@ description: Loggt jeden Aufruf von inlet(), stream(), outlet(), process_tool_re
 import functools
 import inspect
 import logging
+import re
 import time
 import weakref
 from pydantic import BaseModel, Field
@@ -95,13 +96,13 @@ _active_filter = None
 # The function ID this module was imported under, needed to read the valves as
 # they are stored right now — see _stored_valves().
 #
-# Open WebUI loads every function module as f"function_{function_id}"
-# (utils/plugin.py), so the module name is the only place the ID the user chose
-# on import can be read from. Outside Open WebUI — tests, a direct import — the
-# name does not match and the ID stays None.
-_OWN_FUNCTION_ID = (
-    __name__[len("function_"):] if __name__.startswith("function_") else None
-)
+# Open WebUI names every function module after the ID the user chose on import
+# (utils/plugin.py), so the module name is the only place it can be read from:
+# f"function_{function_id}" up to 0.11.x, f"function_{function_id}_{uuid hex}"
+# from 0.12.0 on — the 32 hex digits are stripped again. Outside Open WebUI —
+# tests, a direct import — the name does not match and the ID stays None.
+_OWN_FUNCTION_ID_MATCH = re.fullmatch(r"function_(.+?)(?:_[0-9a-f]{32})?", __name__)
+_OWN_FUNCTION_ID = _OWN_FUNCTION_ID_MATCH.group(1) if _OWN_FUNCTION_ID_MATCH else None
 
 # The stored valves are read per tool call, not per log field. One second is
 # short enough that a valve flipped in the UI takes effect on the next call and
