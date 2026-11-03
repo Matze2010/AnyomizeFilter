@@ -1,13 +1,14 @@
 """
 title: hook_logger
 author: Mathias Gisch
-version: 0.6.0
+version: 0.6.1
 description: Loggt jeden Aufruf von inlet(), stream(), outlet(), process_tool_result() und jedes Tool-Ergebnis, ohne etwas zu verändern. Optional (Valve outlet_overwrite, aus): ersetzt in outlet() die fertige Antwort komplett — Proof of Concept.
 """
 
 import functools
 import inspect
 import logging
+import re
 import time
 import weakref
 from pydantic import BaseModel, Field
@@ -63,7 +64,7 @@ from typing import Any, Dict, Optional
 
 # Logged when the patches are installed. Open WebUI shows no version anywhere,
 # so this is the only way to tell from a log which source is actually running.
-_VERSION = "0.6.0"
+_VERSION = "0.6.1"
 
 # Marks a function this module has already wrapped, so that reloading the
 # filter in Open WebUI does not stack wrapper upon wrapper.
@@ -93,15 +94,15 @@ _tool_names: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 _active_filter = None
 
 # The function ID this module was imported under, needed to read the valves as
-# they are stored right now — see _stored_valves().
+# they are stored right now — see _refresh_stored_valves().
 #
-# Open WebUI loads every function module as f"function_{function_id}"
-# (utils/plugin.py), so the module name is the only place the ID the user chose
-# on import can be read from. Outside Open WebUI — tests, a direct import — the
-# name does not match and the ID stays None.
-_OWN_FUNCTION_ID = (
-    __name__[len("function_"):] if __name__.startswith("function_") else None
-)
+# Open WebUI names every function module after the ID the user chose on import
+# (utils/plugin.py), so the module name is the only place it can be read from:
+# f"function_{function_id}" up to 0.11.x, f"function_{function_id}_{uuid hex}"
+# from 0.12.0 on — the 32 hex digits are stripped again. Outside Open WebUI —
+# tests, a direct import — the name does not match and the ID stays None.
+_OWN_FUNCTION_ID_MATCH = re.fullmatch(r"function_(.+?)(?:_[0-9a-f]{32})?", __name__)
+_OWN_FUNCTION_ID = _OWN_FUNCTION_ID_MATCH.group(1) if _OWN_FUNCTION_ID_MATCH else None
 
 # The stored valves are read per tool call, not per log field. One second is
 # short enough that a valve flipped in the UI takes effect on the next call and
@@ -114,8 +115,8 @@ _valve_cache: Dict[str, Any] = {"read_at": 0.0, "values": None}
 _valve_store_warned = False
 
 
-def _stored_valves() -> Optional[Dict[str, Any]]:
-    """The valve values as they are stored right now, or None.
+async def _refresh_stored_valves() -> None:
+    """Read the valve values as they are stored right now into the cache.
 
     Reading _active_filter.valves alone is not enough. The wrappers hang on
     middleware and run for every tool call of the instance, while the Filter
@@ -125,25 +126,32 @@ def _stored_valves() -> Optional[Dict[str, Any]]:
     no effect on the wrappers at all: they keep reading the valves the previous
     module was built with. The stored values are the ones the UI writes, so
     they are asked first and the instance is only the fallback.
+
+    Async because Functions.get_function_valves_by_id() is a coroutine (Open
+    WebUI 0.11 and 0.12). Called with await at the entry of every async wrapper;
+    everything below reads the cache synchronously through _stored_valves().
+    Never raises: a store that cannot be read leaves the cache as it is.
     """
 
     global _valve_store_warned
 
     if _OWN_FUNCTION_ID is None:
         # Not loaded as an Open WebUI function — nothing to read from.
-        return None
+        return
 
     now = time.monotonic()
     if (
         _valve_cache["values"] is not None
         and now - _valve_cache["read_at"] < _VALVE_CACHE_TTL
     ):
-        return _valve_cache["values"]
+        return
 
     try:
         from open_webui.models.functions import Functions
 
         values = Functions.get_function_valves_by_id(_OWN_FUNCTION_ID)
+        if inspect.isawaitable(values):
+            values = await values
     except Exception as e:
         if not _valve_store_warned:
             _valve_store_warned = True
@@ -152,14 +160,28 @@ def _stored_valves() -> Optional[Dict[str, Any]]:
                 f"wrappers fall back to the loaded instance, so a valve change "
                 f"only takes effect once the filter module is reloaded"
             )
-        return None
+        return
 
+    # No row yet means no valve was ever saved: the defaults of the instance
+    # apply, which is exactly what an empty dict falls back to.
+    if values is None:
+        values = {}
     if not isinstance(values, dict):
-        return None
+        return
 
     _valve_cache["values"] = values
     _valve_cache["read_at"] = now
-    return values
+
+
+def _stored_valves() -> Optional[Dict[str, Any]]:
+    """The stored valve values last read by _refresh_stored_valves(), or None.
+
+    Synchronous, so the sync tool wrapper and the log helpers can use it. A
+    value older than _VALVE_CACHE_TTL is still returned: it is the last state
+    the UI wrote, and the next async wrapper refreshes it.
+    """
+
+    return _valve_cache["values"]
 
 
 def _valve_enabled(name: str) -> bool:
@@ -360,6 +382,7 @@ def _wrap_tool_callable(name: str, fn):
 
         @functools.wraps(fn)
         async def wrapper(*args, **kwargs):
+            await _refresh_stored_valves()
             _before(kwargs)
             try:
                 result = await fn(*args, **kwargs)
@@ -373,6 +396,8 @@ def _wrap_tool_callable(name: str, fn):
 
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
+            # Cannot await the store here; reads the valves the last async
+            # wrapper fetched, or the instance before that.
             _before(kwargs)
             try:
                 result = fn(*args, **kwargs)
@@ -518,6 +543,7 @@ def _install_process_tool_result_patch() -> bool:
 
     @functools.wraps(original)
     async def patched(*args, **kwargs):
+        await _refresh_stored_valves()
         enabled = _valve_enabled("log_process_tool_result")
 
         # Logged before the original runs, so a call that hangs downstream is
