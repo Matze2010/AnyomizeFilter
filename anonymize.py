@@ -2,7 +2,7 @@
 title: anonymize.py
 description: "Filter for anonymizing and deanonymizing text and files using an external API. The filter can be toggled on/off and configured via valves."
 author: Mathias Gisch
-version: 1.9.1
+version: 1.9.2
 """
 
 import asyncio
@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 
 # Logged when the patch is installed. Open WebUI shows no version anywhere, so
 # this is the only way to tell from a log which source is actually running.
-_VERSION = "1.9.1"
+_VERSION = "1.9.2"
 
 # The oldest Open WebUI this filter is built for. 0.11.2 added the "request"
 # filter hook that Filter.request() lives on; before it, everything Open WebUI
@@ -582,8 +582,75 @@ def _mask_text(text: str, mask_map: List[Tuple[str, str]]) -> Tuple[str, List[st
     return masked, hits
 
 
+def _json_mask_map(mask_map: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    """The mask map for JSON text: every original in the forms JSON writes it.
+
+    The arguments of a tool call are JSON text, so an original holding a quote,
+    a backslash, a newline or — with ensure_ascii — an umlaut is in there only
+    escaped. Under the call_tool dispatcher of Tool Search (0.13.0) the real
+    arguments are a JSON string inside that JSON, escaped twice. Both levels and
+    both escaping styles are covered; for an original of plain ASCII letters all
+    of them are the original itself.
+
+    The placeholders need no escaping at any level, so they go in as they are.
+    Longest first, for the same reason as in _canonical_placeholders().
+    """
+
+    mapping: Dict[str, str] = {}
+    for original, placeholder in mask_map:
+        for outer_ascii in (False, True):
+            once = json.dumps(original, ensure_ascii=outer_ascii)[1:-1]
+            mapping.setdefault(once, placeholder)
+            for inner_ascii in (False, True):
+                twice = json.dumps(once, ensure_ascii=inner_ascii)[1:-1]
+                mapping.setdefault(twice, placeholder)
+
+    return sorted(mapping.items(), key=lambda item: len(item[0]), reverse=True)
+
+
+def _tool_call_argument_holders(message: Dict[str, Any]):
+    """Yield every dict of one message that carries tool call arguments as text.
+
+    stream() puts the original values into the arguments of a tool call so the
+    tool can find what it is asked for — and Open WebUI keeps exactly those
+    arguments. They come back with the next provider call of the tool loop, and
+    with every later turn, in two shapes:
+
+      * message["tool_calls"][i]["function"] — the assistant message built for
+        the provider (convert_output_to_messages()),
+      * message["output"][i] of type "function_call", plus its
+        "provider_function" — the call_tool dispatcher as the model wrote it,
+        kept for the replay (0.13.0).
+
+    Only dicts whose "arguments" is a string are yielded: a dict of arguments
+    is serialized by Open WebUI later and would need a walk of its own.
+    """
+
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list):
+        for tool_call in tool_calls:
+            function = tool_call.get("function") if isinstance(tool_call, dict) else None
+            if isinstance(function, dict) and isinstance(function.get("arguments"), str):
+                yield function
+
+    output = message.get("output")
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict) or item.get("type") != "function_call":
+                continue
+            if isinstance(item.get("arguments"), str):
+                yield item
+            provider_function = item.get("provider_function")
+            if isinstance(provider_function, dict) and isinstance(
+                provider_function.get("arguments"), str
+            ):
+                yield provider_function
+
+
 def _apply_to_message_text(
-    message: Dict[str, Any], transform: Callable[[str], Tuple[str, List[str]]]
+    message: Dict[str, Any],
+    transform: Callable[[str], Tuple[str, List[str]]],
+    json_transform: Optional[Callable[[str], Tuple[str, List[str]]]] = None,
 ) -> List[str]:
     """Run transform over every piece of text of one message. Returns the hits.
 
@@ -591,9 +658,18 @@ def _apply_to_message_text(
     "content" as a list of parts (multimodal messages), and the structured
     output blocks the frontend renders from — the same ones outlet() writes to,
     see Filter._output_text_items().
+
+    json_transform, when given, runs over the arguments of every tool call of
+    the message, see _tool_call_argument_holders(). It is a transform of its
+    own because the arguments are JSON text, see _json_mask_map().
     """
 
     hits: List[str] = []
+
+    if json_transform is not None:
+        for holder in _tool_call_argument_holders(message):
+            holder["arguments"], hit = json_transform(holder["arguments"])
+            hits.extend(hit)
 
     content = message.get("content")
     if isinstance(content, str):
@@ -628,6 +704,13 @@ def _message_text(message: Dict[str, Any]) -> str:
         )
 
     texts.extend(item["text"] for item in Filter._output_text_items(message))
+
+    # The arguments as well: a rebuilt mapping has to know the originals that
+    # only ever reached a tool, and a placeholder in there is as orphaned as
+    # one in the text.
+    texts.extend(
+        holder["arguments"] for holder in _tool_call_argument_holders(message)
+    )
 
     return "\n\n".join(text for text in texts if text)
 
@@ -1495,13 +1578,16 @@ class Filter:
             else []
         )
         mask_map = _canonical_placeholders(chat_id, request_pairs)
+        json_mask_map = _json_mask_map(mask_map)
 
         masked = 0
         hits: List[str] = []
         if mask_map:
             for message in targets:
                 hit = _apply_to_message_text(
-                    message, lambda text: _mask_text(text, mask_map)
+                    message,
+                    lambda text: _mask_text(text, mask_map),
+                    lambda text: _mask_text(text, json_mask_map),
                 )
                 if hit:
                     masked += 1
@@ -1551,7 +1637,10 @@ class Filter:
           * the <source> blocks of RAG, of knowledge files, of web search and of
             legacy (prompt-based) tool calls,
           * the messages assembled from the output blocks for the next round of
-            a tool call.
+            a tool call — including the arguments of the tool calls, which
+            carry the original values stream() put in for the tool, see
+            _tool_call_argument_holders(). The tool itself runs on the stored
+            output; request() only ever gets copies of these.
 
         This is therefore the last point at which any of it can still be masked,
         and the reason the monkey patch of drain_approved_tool_calls() this
